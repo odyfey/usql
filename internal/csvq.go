@@ -1,4 +1,4 @@
-//go:build (!no_base || csvq) && !no_csvq
+//go:build (!no_drivers || csvq) && !no_csvq
 
 package internal
 

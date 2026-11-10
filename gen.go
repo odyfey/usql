@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -18,29 +19,47 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
 	"github.com/mattn/go-runewidth"
 	"github.com/xo/dburl"
-	"github.com/yookoala/realpath"
+	"github.com/xo/usql/internal/readme"
 )
 
 func main() {
 	licenseStart := flag.Int("license-start", 2015, "license start year")
 	licenseAuthor := flag.String("license-author", "Kenneth Shaw", "license author")
-	dburlGen := flag.Bool("dburl-gen", false, "enable dburl generation")
-	dburlDir := flag.String("dburl-dir", getDburlDir(), "dburl dir")
-	dburlLicenseStart := flag.Int("dburl-license-start", 2015, "dburl license start year")
+	examples := flag.Bool("examples", false, "also run the examples of the README, which needs a server of dbrun")
+	examplesDB := flag.String("examples-db", "sqlserver-2025", "the dbrun selector of the database for the examples")
+	examplesDbmeta := flag.String("examples-dbmeta", "../dbmeta", "a checkout of dbmeta, whose test directory runs dbrun")
+	examplesOut := flag.String("examples-out", "", "write each example to NAME.txt in this directory, and leave the README as it is")
 	flag.Parse()
-	if err := run(*licenseStart, *licenseAuthor, *dburlGen, *dburlDir, *dburlLicenseStart); err != nil {
+	if err := run(*licenseStart, *licenseAuthor); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+	if *examples {
+		wd, err := os.Getwd()
+		if err == nil {
+			err = readme.Generate(context.Background(), readme.Options{
+				Dir:    wd,
+				DB:     *examplesDB,
+				Dbmeta: *examplesDbmeta,
+				Out:    *examplesOut,
+			})
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+	}
 }
 
-func run(licenseStart int, licenseAuthor string, dburlGen bool, dburlDir string, dburlLicenseStart int) error {
+func run(licenseStart int, licenseAuthor string) error {
 	wd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -48,10 +67,13 @@ func run(licenseStart int, licenseAuthor string, dburlGen bool, dburlDir string,
 	if err := loadDrivers(filepath.Join(wd, "drivers")); err != nil {
 		return err
 	}
+	if err := loadPlainDrivers(); err != nil {
+		return err
+	}
 	if err := loadCommands(filepath.Join(wd, "metacmd", "cmds.go")); err != nil {
 		return err
 	}
-	if err := writeInternal(filepath.Join(wd, "internal"), baseDrivers, mostDrivers, allDrivers, badDrivers); err != nil {
+	if err := writeInternal(filepath.Join(wd, "internal")); err != nil {
 		return err
 	}
 	if err := writeReadme(wd, true); err != nil {
@@ -63,18 +85,11 @@ func run(licenseStart int, licenseAuthor string, dburlGen bool, dburlDir string,
 	if err := writeCommands(filepath.Join(wd, "metacmd", "descs.go")); err != nil {
 		return err
 	}
-	if dburlGen {
-		if err := writeReadme(dburlDir, false); err != nil {
-			return err
-		}
-		if err := writeDburlLicense(dburlDir, dburlLicenseStart, licenseAuthor); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
-// loadDrivers loads the driver descriptions.
+// loadDrivers loads the description of each driver that has a package under
+// drivers.
 func loadDrivers(wd string) error {
 	skipDirs := []string{"completer", "metadata"}
 	err := fs.WalkDir(os.DirFS(wd), ".", func(n string, d fs.DirEntry, err error) error {
@@ -88,36 +103,44 @@ func loadDrivers(wd string) error {
 		if m == nil || m[0][1] != m[0][2] || slices.Contains(skipDirs, m[0][1]) {
 			return nil
 		}
-		tag, dest := m[0][1], mostDrivers
+		tag := m[0][1]
 		driver, err := parseDriverInfo(tag, filepath.Join(wd, n))
-		switch {
-		case err != nil:
+		if err != nil {
 			return err
-		case driver.Group == "base":
-			dest = baseDrivers
-		case driver.Group == "most":
-		case driver.Group == "all":
-			dest = allDrivers
-		case driver.Group == "bad":
-			dest = badDrivers
-		default:
-			return fmt.Errorf("driver %s has invalid group %q", tag, driver.Group)
 		}
-		dest[tag] = driver
-		if dest[tag].Aliases != nil {
-			for _, alias := range dest[tag].Aliases {
-				wireDrivers[alias[0]] = DriverInfo{
-					Tag:    tag,
-					Driver: alias[0],
-					Pkg:    dest[tag].Pkg,
-					Desc:   alias[1],
-					Wire:   true,
-				}
-			}
-		}
+		allDrivers[tag] = driver
 		return nil
 	})
 	return err
+}
+
+// loadPlainDrivers loads the description of each driver in plainDrivers.
+func loadPlainDrivers() error {
+	for _, p := range plainDrivers {
+		if _, ok := allDrivers[p.Tag]; ok {
+			return fmt.Errorf("driver %s has a package under drivers and an entry in plainDrivers", p.Tag)
+		}
+		scheme, ok := schemeFor(p.Tag)
+		switch {
+		case !ok:
+			return fmt.Errorf("plain driver %q has no dburl scheme", p.Tag)
+		case scheme.GoPackage == "":
+			return fmt.Errorf("plain driver %q has a dburl scheme with no Go package", p.Tag)
+		}
+		allDrivers[p.Tag] = DriverInfo{
+			Tag:        p.Tag,
+			Driver:     scheme.Name,
+			Name:       scheme.Name,
+			Pkg:        scheme.GoPackage,
+			Desc:       scheme.Desc,
+			URL:        scheme.DriverURL,
+			CGO:        scheme.RequiresCGO,
+			Deployment: scheme.Deployment,
+			Build:      p.Build,
+			Plain:      true,
+		}
+	}
+	return nil
 }
 
 // loadCommands loads command descriptions.
@@ -146,21 +169,46 @@ func loadCommands(name string) error {
 	return nil
 }
 
-func writeInternal(wd string, drivers ...map[string]DriverInfo) error {
-	// build known build tags
-	var known []DriverInfo
-	for _, m := range drivers {
-		for _, v := range m {
-			known = append(known, v)
+// writeInternal writes internal.go, and a file for each driver and each
+// feature, into the directory wd.
+func writeInternal(wd string) error {
+	// remove the files written before, so that a driver that is gone leaves
+	// no file behind
+	files, err := filepath.Glob(filepath.Join(wd, "*.go"))
+	if err != nil {
+		return err
+	}
+	for _, name := range files {
+		buf, err := os.ReadFile(name)
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(buf, []byte("\n// Code generated by gen.go. DO NOT EDIT.\n")) {
+			if err := os.Remove(name); err != nil {
+				return err
+			}
 		}
 	}
-	sort.Slice(known, func(i, j int) bool {
-		return known[i].Tag < known[j].Tag
-	})
+	// build known build tags
+	known := sortedDrivers()
 	knownStr := ""
 	for _, v := range known {
-		knownStr += fmt.Sprintf("\n%q: %q, // %s", v.Tag, v.Driver, v.Pkg)
+		knownStr += fmt.Sprintf("\n%q: %q, // %s", v.Tag, v.Name, v.Pkg)
 	}
+	// a driver's extra tags report the same driver, under the folded scheme's
+	// name when the tag is one
+	var extra []string
+	for _, v := range known {
+		for _, tag := range v.Tags {
+			name := v.Name
+			if slices.ContainsFunc(v.Folded, func(s dburl.Scheme) bool { return s.Name == tag }) {
+				name = tag
+			}
+			extra = append(extra, fmt.Sprintf("\n%q: %q, // %s", tag, name, v.Pkg))
+		}
+	}
+	sort.Strings(extra)
+	knownStr += strings.Join(extra, "")
 	// format and write internal.go
 	buf, err := format.Source([]byte(fmt.Sprintf(internalGo, knownStr)))
 	if err != nil {
@@ -170,22 +218,38 @@ func writeInternal(wd string, drivers ...map[string]DriverInfo) error {
 		return err
 	}
 	// write <tag>.go
+	byTag := make(map[string]DriverInfo)
 	for _, v := range known {
-		var tags string
-		switch v.Group {
-		case "base":
-			tags = "(!no_base || " + v.Tag + ")"
-		case "most":
-			tags = "(all || most || " + v.Tag + ")"
-		case "all":
-			tags = "(all || " + v.Tag + ")"
-		case "bad":
-			tags = "(bad || " + v.Tag + ")"
-		default:
-			panic(v.Tag)
+		byTag[v.Tag] = v
+	}
+	for _, v := range known {
+		// a driver that is built on another driver, as tidb is on mysql, goes
+		// when that driver goes
+		var also []string
+		for _, imp := range v.Imports {
+			if d, ok := byTag[imp]; ok {
+				also = append(append(also, d.Tag), d.Tags...)
+			}
 		}
-		tags += " && !no_" + v.Tag
-		buf, err := format.Source([]byte(fmt.Sprintf(internalTagGo, tags, "github.com/xo/usql/drivers/"+v.Tag, v.Desc)))
+		tags := buildConstraint(v.Tag, v.Tags, also, v.Build)
+		src := fmt.Sprintf(internalTagGo, tags, "github.com/xo/usql/drivers/"+v.Tag, v.Desc)
+		if v.Plain {
+			src = fmt.Sprintf(internalPlainGo, tags, v.Pkg, v.Name)
+		}
+		buf, err := format.Source([]byte(src))
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(wd, v.Tag+".go"), buf, 0o644); err != nil {
+			return err
+		}
+	}
+	// write the features, which are gated the same way as the drivers but are
+	// not drivers: they register no URL scheme and they are absent from
+	// KnownBuildTags and from the driver table in the README.
+	for _, v := range features {
+		tags := buildConstraint(v.Tag, nil, nil, v.Build)
+		buf, err := format.Source([]byte(fmt.Sprintf(internalFeatureGo, tags, v.Pkg, v.Desc)))
 		if err != nil {
 			return err
 		}
@@ -194,6 +258,35 @@ func writeInternal(wd string, drivers ...map[string]DriverInfo) error {
 		}
 	}
 	return nil
+}
+
+// buildConstraint returns the //go:build constraint for a driver or a
+// feature, named by tag.
+//
+// A build includes every driver and every feature. The tag no_<tag> leaves one
+// out. The tag no_drivers leaves out all of them, except those that the build
+// names by tag, so that `-tags 'no_drivers sqlite3'` builds usql with only the
+// sqlite3 driver.
+//
+// also are further tags that select the driver, taken from a Tags: entry. Each
+// selects it as its own tag does, and each no_ form excludes it.
+//
+// deps are the tags of the drivers that the driver is built on. Each no_ form
+// excludes it.
+//
+// extra is a constraint of its own, taken from a Build: entry. A driver or a
+// feature that cannot compile everywhere states so there, and it is combined
+// here rather than in build.sh, so that `go build -tags ...` excludes it too.
+func buildConstraint(tag string, also, deps []string, extra string) string {
+	names := strings.Join(append([]string{tag}, also...), " || ")
+	tags := "(!no_drivers || " + names + ")"
+	for _, t := range append(append([]string{tag}, also...), deps...) {
+		tags += " && !no_" + t
+	}
+	if extra != "" {
+		tags = "(" + tags + ") && (" + extra + ")"
+	}
+	return tags
 }
 
 func writeReadme(dir string, includeTagSummary bool) error {
@@ -232,14 +325,6 @@ func writeLicenseFiles(licenseStart int, licenseAuthor string) error {
 	return nil
 }
 
-func writeDburlLicense(dir string, licenseStart int, licenseAuthor string) error {
-	s := fmt.Sprintf(license, licenseStart, time.Now().Year(), licenseAuthor)
-	if err := os.WriteFile(filepath.Join(dir, "LICENSE"), append([]byte(s), '\n'), 0o644); err != nil {
-		return err
-	}
-	return nil
-}
-
 func writeCommands(name string) error {
 	// format and write internal.go
 	var names, descs string
@@ -258,18 +343,21 @@ func writeCommands(name string) error {
 	return os.WriteFile(name, buf, 0644)
 }
 
-var (
-	// baseDrivers are drivers included in a build with no build tags listed.
-	baseDrivers = map[string]DriverInfo{}
-	// mostDrivers are drivers included with the most tag. Populated below.
-	mostDrivers = map[string]DriverInfo{}
-	// allDrivers are drivers forced to 'all' build tag.
-	allDrivers = map[string]DriverInfo{}
-	// badDrivers are drivers forced to 'bad' build tag.
-	badDrivers = map[string]DriverInfo{}
-	// wireDrivers are the wire compatible drivers.
-	wireDrivers = map[string]DriverInfo{}
-)
+// allDrivers are the drivers, by build tag. loadDrivers and loadPlainDrivers
+// fill it.
+var allDrivers = map[string]DriverInfo{}
+
+// sortedDrivers returns the drivers in the order of their build tags.
+func sortedDrivers() []DriverInfo {
+	var drivers []DriverInfo
+	for _, v := range allDrivers {
+		drivers = append(drivers, v)
+	}
+	sort.Slice(drivers, func(i, j int) bool {
+		return drivers[i].Tag < drivers[j].Tag
+	})
+	return drivers
+}
 
 // cmds are the meta command descriptions.
 var cmds map[string][]desc
@@ -277,9 +365,21 @@ var cmds map[string][]desc
 type DriverInfo struct {
 	// Tag is the build Tag / name of the directory the driver lives in.
 	Tag string
-	// Driver is the Go SQL Driver Driver (parsed from the import tagged with //
-	// DRIVER: <Driver>), otherwise same as the tag / directory Driver.
+	// Driver is the dburl scheme the driver documents.
 	Driver string
+	// Name is the name the driver registers under in usql, which is the
+	// SchemeName that dburl sets on a URL.
+	Name string
+	// Tags are further build tags that select the driver, parsed from the doc
+	// comment's "Tags:" entry.
+	Tags []string
+	// Folded are the dburl schemes among Tags. The driver registers under
+	// each of them as well, and its README row lists them and their aliases.
+	Folded []dburl.Scheme
+	// Imports are the packages under drivers that the driver imports, by
+	// directory name. An import of another driver excludes this driver when
+	// that one is excluded.
+	Imports []string
 	// Pkg is the imported driver package, taken from the import tagged with
 	// DRIVER.
 	Pkg string
@@ -291,12 +391,203 @@ type DriverInfo struct {
 	// CGO is whether or not the driver requires CGO, based on presence of
 	// 'Requires CGO.' in the comment
 	CGO bool
-	// Aliases are the parsed Alias: entries.
-	Aliases [][]string
-	// Wire indicates it is a Wire compatible driver.
-	Wire bool
-	// Group is the build Group
-	Group string
+	// Deployment is the deployment kinds the database offers, from dburl.
+	Deployment dburl.Deployment
+	// Build is an extra build constraint, from the Build: entry of the doc
+	// comment or from plainDrivers. It is combined with the constraint of the
+	// tags in the generated internal file. A driver uses it to exclude a
+	// platform it cannot compile for.
+	Build string
+	// Plain is whether the driver is in plainDrivers. It has no package under
+	// drivers, and its internal file imports Pkg and registers it.
+	Plain bool
+}
+
+// Plain is a driver that usql registers with no hooks. It has no package under
+// drivers. gen.go writes the import of its database/sql driver, and the call
+// to drivers.Register, into the file of the driver in internal.
+//
+// The dburl scheme of the tag gives everything else: the package to import,
+// the name to register, and the row of the README.
+type Plain struct {
+	// Tag is the build tag, and names the file written into internal.
+	Tag string
+	// Build is an extra build constraint, with the same meaning as the Build:
+	// entry of a driver package.
+	Build string
+}
+
+// plainDrivers are the drivers that usql registers with no hooks, in the
+// order of their tags. A driver that needs a hook, such as Err or Version,
+// has a package under drivers instead. Each comment holds what usql knows of
+// the driver that dburl and dbmeta do not hold.
+var plainDrivers = []Plain{
+	// dbimp's driver, pure Go, over the cursor API of HTTP.
+	{Tag: "arangodb"},
+	// dbimp's driver, pure Go, over HTTP. The URL is
+	// athena://key:secret@host/database?workgroup=wg&output=s3://bucket/results/.
+	// The server refuses a transaction, so \copy inserts each row without one.
+	{Tag: "athena"},
+	// dbimp's driver, pure Go, over the JSON of the HTTP API of Avatica, for
+	// the standalone Avatica server and for the Apache Phoenix Query Server.
+	// The URL is avatica://user:password@host:port, with the keys tls and
+	// auth, and no path.
+	{Tag: "avatica"},
+	// dbimp's driver, pure Go, over HTTP. The user of the URL is ignored. The
+	// service refuses a transaction, so \copy inserts each row without one.
+	{Tag: "bigquery"},
+	// github.com/xo/cassandra. The driver reports its own errors and row
+	// counts, and a refused credential through the method
+	// AuthenticationRefused of its errors (W66). dburl sets the timeout of a
+	// request to five minutes when the URL has none. A batch from BEGIN BATCH
+	// to APPLY BATCH is one statement, which the grammar of usql reads.
+	{Tag: "cassandra"},
+	// ChaiSQL, embedded. build.sh leaves it out of a build for 32 bit arm.
+	{Tag: "chai"},
+	// dbimp's driver, which speaks HTTP only, on port 8123 or, with
+	// tls=true, 8443. It has no native protocol, and it refuses every key of
+	// the URL but tls. ClickHouse has no transactions over HTTP, so \copy
+	// inserts each row without one.
+	{Tag: "clickhouse"},
+	// dbimp's driver, pure Go, over HTTP. It reads only: Exec and BeginTx
+	// fail with dbimp.ErrNotSupported. A wrong key is HTTP 401 on a hosted
+	// account, and the emulator does not check it.
+	{Tag: "cosmos"},
+	// dbimp's driver, pure Go.
+	{Tag: "couchbase"},
+	// dbimp's driver, which replaced github.com/datafuselabs/databend-go in
+	// dbimp v0.6.0. It refuses the keys of databend-go, such as sslmode,
+	// tenant and warehouse. A statement such as CREATE TABLE sends no count
+	// of rows, which the driver reports as ErrNotSupported (dbimp's D125).
+	{Tag: "databend"},
+	// dbimp's driver, pure Go, over HTTP. A wrong token is HTTP 403 with the
+	// message "Invalid access token". The API has no session, so \copy
+	// inserts each row without a transaction.
+	{Tag: "databricks"},
+	// dbimp's driver, pure Go, over HTTP.
+	{Tag: "drill"},
+	// dbimp's driver, pure Go, over the SQL API of the Router or the Broker.
+	// It reads only, because the SQL API of Druid refuses INSERT, REPLACE,
+	// UPDATE and DELETE.
+	{Tag: "druid"},
+	// Needs cgo. The prebuilt library has no build for 32 bit arm.
+	{Tag: "duckdb", Build: "!(linux && arm)"},
+	// dbimp's driver, pure Go, over HTTP. The URL is
+	// dynamodb://key:secret@host:port?region=us-east-1, and a missing key is
+	// dburl.ErrMissingUser.
+	{Tag: "dynamodb"},
+	// dbimp's driver, pure Go, over HTTP. It reads only, because the SQL of
+	// Elasticsearch reads only.
+	{Tag: "elasticsearch"},
+	// dbimp's driver, pure Go, over the WebSocket API of Exasol.
+	{Tag: "exasol"},
+	// Registers under firebirdsql, the name of the scheme in dburl.
+	{Tag: "firebird"},
+	// Apache Arrow v18.
+	{Tag: "flightsql"},
+	// dbimp's driver, pure Go, over the HTTP transport of HiveServer2. It
+	// serves Impala too. The URL is
+	// hive://user:password@host:port/database?httpPath=cliservice, and the
+	// default port is 10001. The binary ports, 10000 on Hive and 21050 on
+	// Impala, do not work. It has no parameters and no transactions, and it
+	// writes each argument into the text of the statement. See docs/HIVE.md
+	// in dbimp.
+	{Tag: "hive"},
+	// dbimp's hive driver. dburl writes port 28000, the HTTP port of Impala.
+	// Impala does not report the rows that a statement changed.
+	{Tag: "impala"},
+	// dbimp's driver, pure Go, over the Hrana protocol on HTTP, for sqld and
+	// Turso Cloud. TLS is on unless the URL sets tls=false. The token is the
+	// password of the URL. A transaction ends when no statement runs on it
+	// for 10 seconds, and the server then rolls it back.
+	{Tag: "libsql"},
+	// dbimp's driver, pure Go, over the REST API of MaxCompute over HTTPS.
+	// It has no parameters and no transactions, and it writes each argument
+	// into the text of the statement. The server cuts a result at 10,000 rows
+	// and returns no error. See docs/MAXCOMPUTE.md in dbimp.
+	{Tag: "maxcompute"},
+	// dbimp's driver, pure Go, over the Query API of HTTP.
+	{Tag: "neo4j"},
+	// github.com/xo/odbc, pure Go on purego, so it needs no cgo. It loads the
+	// driver manager of the system when a connection opens. The URL is
+	// odbc+<driver>://user:pass@host:port/db, and a setting of the ODBC
+	// driver goes in the query. It reports a refused credential through the
+	// method AuthenticationRefused of its errors (W66). The SQLite ODBC
+	// driver crashes on Linux in a build that links go-sqlite3 and DuckDB,
+	// and the README says to build with the tag libsqlite3 (W40).
+	{Tag: "odbc"},
+	// dbimp's driver, pure Go, over HTTP. OpenSearch has its own driver,
+	// apart from Elasticsearch (dbimp's D162). It reads only.
+	{Tag: "opensearch"},
+	// github.com/xo/oracle, pure Go. It reports a refused credential through
+	// the method AuthenticationRefused of its errors (W66).
+	{Tag: "oracle"},
+	// dbimp's driver, pure Go, over the query API of the Broker. It reads
+	// only, because the Broker refuses a write of rows.
+	{Tag: "pinot"},
+	// dbimp's trino driver, which speaks the protocol of Presto too. dburl
+	// writes flavor=presto, so the driver does not ask the server which
+	// product it is.
+	{Tag: "presto"},
+	// dbimp's driver, pure Go, over the HTTP API of rqlite. rqlite shares one
+	// write connection among every client, so the driver has no
+	// transactions, and \copy inserts each row without one.
+	{Tag: "rqlite"},
+	// dbimp's driver, pure Go, over the SQL REST API of Snowflake. The URL is
+	// snowflake://user:key@host/database/schema?role=r, and the password is
+	// the private key, as base64url PKCS8 DER. The server has no transaction
+	// across requests, so BeginTx fails and \copy inserts each row without
+	// one.
+	{Tag: "snowflake"},
+	// dbimp's driver, pure Go, over HTTP. It reads only, because the SQL of
+	// Solr has no write.
+	{Tag: "solr"},
+	// dbimp's driver, pure Go, over HTTP. The emulator accepts a wrong token.
+	{Tag: "spanner"},
+	// dbimp's driver, pure Go.
+	{Tag: "surrealdb"},
+	// dbimp's driver, pure Go, over the API of Tablestore over HTTPS. It has
+	// no parameters and no transactions. It sends one statement in each
+	// request, and holds the whole result in memory. See docs/TABLESTORE.md
+	// in dbimp.
+	{Tag: "tablestore"},
+	// dbimp's driver, which serves Presto too. The URL is
+	// trino://user:password@host:port/catalog/schema, and dburl writes the
+	// user "user" when the URL has none.
+	{Tag: "trino"},
+	// The VoltDB client.
+	{Tag: "voltdb"},
+}
+
+// Feature is a part of usql that is gated by a build tag, in the same way a
+// driver is.
+//
+// A feature is not a driver. It registers no URL scheme, so it does not appear
+// in KnownBuildTags or in the driver table in the README. It exists because a
+// package can cost a large part of the size of the binary without being a
+// driver, and the only way to leave such a package out is a build tag that
+// reaches the import itself.
+type Feature struct {
+	// Tag is the build tag, and names the file written into internal.
+	Tag string
+	// Pkg is the package that the generated file imports for its init.
+	Pkg string
+	// Desc is the comment written beside that import.
+	Desc string
+	// Build is an extra build constraint, with the same meaning as a driver's.
+	Build string
+}
+
+// features are the features that a build tag can leave out.
+var features = []Feature{
+	{
+		// The renderer runs ECharts in a JavaScript engine and rasterizes the
+		// result with an SVG renderer. The two together are about 12 MiB of
+		// any binary they are linked into, so no_charts leaves them out.
+		Tag:  "charts",
+		Pkg:  "github.com/xo/usql/metacmd/charts/echarts",
+		Desc: "ECharts chart renderer",
+	},
 }
 
 func parseDriverInfo(tag, filename string) (DriverInfo, error) {
@@ -304,63 +595,80 @@ func parseDriverInfo(tag, filename string) (DriverInfo, error) {
 	if err != nil {
 		return DriverInfo{}, err
 	}
-	name := tag
-	var pkg string
-	for _, imp := range f.Imports {
-		if imp.Comment == nil || len(imp.Comment.List) == 0 || !strings.Contains(imp.Comment.List[0].Text, "DRIVER") {
-			continue
-		}
-		pkg = imp.Path.Value[1 : len(imp.Path.Value)-1]
-		if i := strings.Index(imp.Comment.List[0].Text, ":"); i != -1 {
-			name = strings.TrimSpace(imp.Comment.List[0].Text[i+1:])
-		}
-		break
+	// The driver's facts come from dburl. Only the build system's own fields
+	// are parsed from the doc comment.
+	scheme, ok := schemeFor(tag)
+	if !ok {
+		return DriverInfo{}, fmt.Errorf("driver %q has no dburl scheme", tag)
 	}
-	// parse doc comment
 	comment := f.Doc.Text()
-	prefix := "Package " + tag + " defines and registers usql's "
-	if !strings.HasPrefix(comment, prefix) {
-		return DriverInfo{}, fmt.Errorf("invalid doc comment prefix for driver %q", tag)
+	// parse build:
+	var build string
+	if buildm := buildRE.FindAllStringSubmatch(comment, -1); buildm != nil {
+		build = strings.TrimSpace(buildm[0][1])
 	}
-	desc := strings.TrimPrefix(comment, prefix)
-	i := strings.Index(desc, " driver.")
-	if i == -1 {
-		return DriverInfo{}, fmt.Errorf("cannot find description suffix for driver %q", tag)
+	// parse tags:
+	var tags []string
+	if tagsm := tagsRE.FindAllStringSubmatch(comment, -1); tagsm != nil {
+		tags = strings.Fields(strings.ReplaceAll(tagsm[0][1], ",", " "))
 	}
-	desc = strings.TrimSpace(desc[:i])
-	if desc == "" {
-		return DriverInfo{}, fmt.Errorf("unable to parse description for driver %q", tag)
+	// a tag that is a scheme folds that scheme into the row, and the row takes
+	// the name of the database from the scheme that names the dialect
+	desc := scheme.Desc
+	var folded []dburl.Scheme
+	for _, t := range tags {
+		if s, ok := schemeFor(t); ok && s.Name == t {
+			folded = append(folded, s)
+			if s.Name == scheme.Dialect {
+				desc = s.Desc
+			}
+		}
 	}
-	// parse alias:
-	var aliases [][]string
-	aliasesm := aliasRE.FindAllStringSubmatch(comment, -1)
-	for _, m := range aliasesm {
-		s := strings.Split(m[1], ",")
-		aliases = append(aliases, []string{
-			strings.TrimSpace(s[0]),
-			strings.TrimSpace(s[1]),
-		})
-	}
-	// parse see: url
-	urlm := seeRE.FindAllStringSubmatch(comment, -1)
-	if urlm == nil {
-		return DriverInfo{}, fmt.Errorf("missing See: <URL> for driver %q", tag)
-	}
-	// parse group:
-	group := "most"
-	if groupm := groupRE.FindAllStringSubmatch(comment, -1); groupm != nil {
-		group = strings.TrimSpace(groupm[0][1])
+	var imports []string
+	for _, imp := range f.Imports {
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			return DriverInfo{}, err
+		}
+		if dir, ok := strings.CutPrefix(path, "github.com/xo/usql/drivers/"); ok && !strings.Contains(dir, "/") {
+			imports = append(imports, dir)
+		}
 	}
 	return DriverInfo{
-		Tag:     tag,
-		Driver:  name,
-		Pkg:     pkg,
-		Desc:    cleanRE.ReplaceAllString(desc, ""),
-		URL:     strings.TrimSpace(urlm[0][1]),
-		CGO:     strings.Contains(cleanRE.ReplaceAllString(comment, ""), "Requires CGO."),
-		Aliases: aliases,
-		Group:   group,
+		Tag:        tag,
+		Driver:     scheme.Name,
+		Name:       scheme.Name,
+		Tags:       tags,
+		Folded:     folded,
+		Imports:    imports,
+		Pkg:        scheme.GoPackage,
+		Desc:       desc,
+		URL:        scheme.DriverURL,
+		CGO:        scheme.RequiresCGO,
+		Deployment: scheme.Deployment,
+		Build:      build,
 	}, nil
+}
+
+// schemes indexes dburl's schemes by driver name and by alias, so that a usql
+// build tag resolves even when it differs from the scheme.
+var schemes = sync.OnceValue(func() map[string]dburl.Scheme {
+	m := make(map[string]dburl.Scheme)
+	for _, scheme := range dburl.BaseSchemes() {
+		m[scheme.Name] = scheme
+		for _, alias := range scheme.Aliases {
+			if _, ok := m[alias]; !ok {
+				m[alias] = scheme
+			}
+		}
+	}
+	return m
+})
+
+// schemeFor returns the dburl scheme for a usql build tag.
+func schemeFor(tag string) (dburl.Scheme, bool) {
+	scheme, ok := schemes()[tag]
+	return scheme, ok
 }
 
 // desc is a meta command description.
@@ -417,55 +725,56 @@ func findCommand(name string) string {
 func buildDriverTable(includeTagSummary bool) string {
 	hdr := []string{"Database", "Scheme / Tag", "Scheme Aliases", "Driver Package / Notes"}
 	widths := []int{len(hdr[0]), len(hdr[1]), len(hdr[2]), len(hdr[3])}
-	baseRows, widths := buildRows(baseDrivers, widths)
-	mostRows, widths := buildRows(mostDrivers, widths)
-	allRows, widths := buildRows(allDrivers, widths)
-	badRows, widths := buildRows(badDrivers, widths)
-	wireRows, widths := buildRows(wireDrivers, widths)
+	// the drivers of firstOrder come first, and the others follow in the
+	// order of their descriptions
+	var first, rest []DriverInfo
+	for _, v := range sortedDrivers() {
+		if slices.Contains(firstOrder, v.Tag) {
+			first = append(first, v)
+		} else {
+			rest = append(rest, v)
+		}
+	}
+	sort.Slice(first, func(i, j int) bool {
+		return slices.Index(firstOrder, first[i].Tag) < slices.Index(firstOrder, first[j].Tag)
+	})
+	sort.SliceStable(rest, func(i, j int) bool {
+		return strings.ToLower(rest[i].Desc) < strings.ToLower(rest[j].Desc)
+	})
+	firstRows, widths := buildRows(first, widths)
+	restRows, widths := buildRows(rest, widths)
 	s := tableRows(widths, ' ', hdr)
 	s += tableRows(widths, '-')
-	s += tableRows(widths, ' ', baseRows...)
+	s += tableRows(widths, ' ', firstRows...)
 	s += tableRows(widths, ' ')
-	s += tableRows(widths, ' ', mostRows...)
-	s += tableRows(widths, ' ')
-	s += tableRows(widths, ' ', allRows...)
-	s += tableRows(widths, ' ')
-	s += tableRows(widths, ' ', wireRows...)
-	s += tableRows(widths, ' ')
-	s += tableRows(widths, ' ', badRows...)
+	s += tableRows(widths, ' ', restRows...)
 	if includeTagSummary {
 		s += tableRows(widths, ' ')
 		s += tableRows(widths, ' ',
-			[]string{"**NO DRIVERS**", "`no_base`", "", "_no base drivers (useful for development)_"},
-			[]string{"**MOST DRIVERS**", "`most`", "", "_all stable drivers_"},
-			[]string{"**ALL DRIVERS**", "`all`", "", "_all drivers, excluding bad drivers_"},
-			[]string{"**BAD DRIVERS**", "`bad`", "", "_bad drivers (broken/non-working drivers)_"},
-			[]string{"**NO &lt;TAG&gt;**", "`no_<tag>`", "", "_exclude driver with `<tag>`_"},
+			[]string{"**NO DRIVERS**", "`no_drivers`", "", "_leave out every driver that is not named by its tag_"},
+			[]string{"**NO &lt;TAG&gt;**", "`no_<tag>`", "", "_leave out the driver with `<tag>`_"},
 		)
 	}
-	return s + "\n" + buildTableLinks(baseDrivers, mostDrivers, allDrivers, badDrivers)
+	return s + "\n" + buildTableLinks()
 }
 
-func buildRows(m map[string]DriverInfo, widths []int) ([][]string, []int) {
-	var drivers []DriverInfo
-	for _, v := range m {
-		drivers = append(drivers, v)
-	}
-	sort.Slice(drivers, func(i, j int) bool {
-		switch {
-		case drivers[i].Group == "base":
-			return baseOrder[drivers[i].Driver] < baseOrder[drivers[j].Driver]
-		}
-		return strings.ToLower(drivers[i].Desc) < strings.ToLower(drivers[j].Desc)
-	})
+func buildRows(drivers []DriverInfo, widths []int) ([][]string, []int) {
 	var rows [][]string
 	for i, v := range drivers {
 		notes := ""
 		if v.CGO {
 			notes += " <sup>[†][f-cgo]</sup>"
 		}
-		if v.Wire {
-			notes += " <sup>[‡][f-wire]</sup>"
+		// Both markers mean the same thing to a reader: there is nothing you
+		// can start. So both exclude a database that also ships a server
+		// anyone can run, as CockroachDB does.
+		if server := v.Deployment&dburl.DeploymentServer != 0; !server {
+			if v.Deployment&dburl.DeploymentEmbedded != 0 {
+				notes += " <sup>[§][f-embedded]</sup>"
+			}
+			if v.Deployment&dburl.DeploymentHosted != 0 {
+				notes += " <sup>[¶][f-hosted]</sup>"
+			}
 		}
 		rows = append(rows, []string{
 			v.Desc,
@@ -483,18 +792,27 @@ func buildRows(m map[string]DriverInfo, widths []int) ([][]string, []int) {
 
 func buildAliases(v DriverInfo) string {
 	name := v.Tag
-	if v.Wire {
-		name = v.Driver
-	}
-	_, aliases := dburl.SchemeDriverAndAliases(name)
-	if v.Wire {
-		aliases = append(aliases, name)
-	}
-	for i := 0; i < len(aliases); i++ {
-		if !v.Wire && aliases[i] == v.Tag {
-			aliases[i] = v.Driver
+	_, own := dburl.SchemeNameAndAliases(name)
+	for i := 0; i < len(own); i++ {
+		if own[i] == v.Tag {
+			own[i] = v.Driver
 		}
 	}
+	// the folded schemes come first, because the row is named for them
+	var aliases []string
+	for _, s := range v.Folded {
+		_, a := dburl.SchemeNameAndAliases(s.Name)
+		aliases = append(append(aliases, s.Name), a...)
+	}
+	aliases = append(aliases, own...)
+	// replacing the tag with the driver name can repeat a name, as it does for
+	// libpq, whose scheme pq is also among the aliases
+	seen := make(map[string]bool)
+	aliases = slices.DeleteFunc(aliases, func(a string) bool {
+		dup := seen[a]
+		seen[a] = true
+		return dup
+	})
 	fileTypes := dburl.FileTypes()
 	if slices.Contains(fileTypes, name) {
 		aliases = append(aliases, `file`)
@@ -527,30 +845,12 @@ func tableRows(widths []int, c rune, rows ...[]string) string {
 	return s
 }
 
-func buildTableLinks(drivers ...map[string]DriverInfo) string {
-	var d []DriverInfo
-	for _, m := range drivers {
-		for _, v := range m {
-			d = append(d, v)
-		}
-	}
-	sort.Slice(d, func(i, j int) bool {
-		return d[i].Tag < d[j].Tag
-	})
+func buildTableLinks() string {
 	var s string
-	for _, v := range d {
+	for _, v := range sortedDrivers() {
 		s += fmt.Sprintf("[d-%s]: %s\n", v.Tag, v.URL)
 	}
 	return s
-}
-
-func getDburlDir() string {
-	dir := filepath.Join(os.Getenv("GOPATH"), "src/github.com/xo/dburl")
-	var err error
-	if dir, err = realpath.Realpath(dir); err != nil {
-		panic(err)
-	}
-	return dir
 }
 
 // decodeCommand decodes a command.
@@ -633,14 +933,15 @@ func decodeCommandDescs(funcName string, doc string) ([]desc, error) {
 	return descs, nil
 }
 
-var baseOrder = map[string]int{
-	"postgres":   0,
-	"mysql":      1,
-	"sqlserver":  2,
-	"oracle":     3,
-	"sqlite3":    4,
-	"clickhouse": 5,
-	"csvq":       6,
+// firstOrder names the drivers that come first in the README table, in order,
+// by tag. The other drivers follow them, in the order of their descriptions.
+var firstOrder = []string{
+	"pgx",
+	"mysql",
+	"sqlserver",
+	"oracle",
+	"sqlite3",
+	"duckdb",
 }
 
 // sections are the section names for meta commands.
@@ -652,7 +953,7 @@ var sections = []string{
 	"Query View",
 	"Query Buffer",
 	"Informational",
-	"Variables",
+	"Settings",
 	"Input/Output",
 	"Control/Conditional",
 	"Transaction",
@@ -661,9 +962,8 @@ var sections = []string{
 
 // regexps.
 var (
-	aliasRE = regexp.MustCompile(`(?m)^Alias:\s+(.*)$`)
-	seeRE   = regexp.MustCompile(`(?m)^See:\s+(.*)$`)
-	groupRE = regexp.MustCompile(`(?m)^Group:\s+(.*)$`)
+	buildRE = regexp.MustCompile(`(?m)^Build:\s+(.*)$`)
+	tagsRE  = regexp.MustCompile(`(?m)^Tags:\s+(.*)$`)
 	cleanRE = regexp.MustCompile(`[\r\n]`)
 	dirRE   = regexp.MustCompile(`^([^/]+)/([^\./]+)\.go$`)
 )
@@ -716,14 +1016,39 @@ import (
        _ %q // %s driver
 )`
 
-const internalGo = `// Package internal provides a way to obtain information about which database
-// drivers were included at build.
+const internalPlainGo = `//go:build %s
 package internal
 
 // Code generated by gen.go. DO NOT EDIT.
 
-// KnownBuildTags returns a map of known driver names to its respective build
-// tags.
+import (
+	_ %q // DRIVER
+
+	"github.com/xo/usql/drivers"
+)
+
+func init() {
+	drivers.Register(%q, drivers.Driver{})
+}`
+
+const internalFeatureGo = `//go:build %s
+package internal
+
+// Code generated by gen.go. DO NOT EDIT.
+
+import (
+       _ %q // %s
+)`
+
+const internalGo = `// Package internal links the drivers and the features of a build of usql,
+// each through a file that gen.go writes with its build constraint. It also
+// says which drivers usql knows.
+package internal
+
+// Code generated by gen.go. DO NOT EDIT.
+
+// KnownBuildTags returns the name that each driver registers under, keyed by
+// its build tag. A driver with more than one tag has an entry for each.
 func KnownBuildTags() map[string]string{
 	return map[string]string{%s
 	}

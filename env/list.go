@@ -14,22 +14,11 @@ import (
 	"github.com/yookoala/realpath"
 )
 
-// Listing writes a formatted listing of the special environment variables to
-// w, separated in sections based on variable type.
+// Listing writes the settings of the configuration to w, by their full
+// names, one section at a time, and then the variables of the environment.
 func Listing(w io.Writer) error {
-	varsWithDesc := make([]string, len(varNames))
-	for i, v := range varNames {
-		varsWithDesc[i] = v.String()
-	}
-	pvarsWithDesc := make([]string, len(pvarNames))
-	for i, v := range pvarNames {
-		pvarsWithDesc[i] = v.String()
-	}
-
 	// determine config dir name
 	configDir, configExtra := buildConfigDir("config.yaml")
-
-	// environment var names
 	configDesc := configDir
 	if configExtra != "" {
 		configDesc = configExtra
@@ -40,11 +29,6 @@ func Listing(w io.Writer) error {
 			fmt.Sprintf(`config file path (default %q)`, configDesc),
 		},
 	}
-	envVarsWithDesc := make([]string, len(envVarNames)+1)
-	for i, v := range append(ev, envVarNames...) {
-		envVarsWithDesc[i] = v.String()
-	}
-
 	if configExtra != "" {
 		configExtra = " (" + configExtra + ")"
 	}
@@ -52,20 +36,32 @@ func Listing(w io.Writer) error {
 		w,
 		variableTpl,
 		text.CommandName,
-		strings.TrimRightFunc(strings.Join(varsWithDesc, ""), unicode.IsSpace),
-		strings.TrimRightFunc(strings.Join(pvarsWithDesc, ""), unicode.IsSpace),
-		strings.TrimRightFunc(strings.Join(envVarsWithDesc, ""), unicode.IsSpace),
 		configDir,
 		configExtra,
+		names(settingNames),
+		names(pvarNames),
+		names(varNames),
+		names(chartNames),
+		names(append(ev, envVarNames...)),
 	)
 	return nil
+}
+
+// names returns the names and the descriptions of a section, without the
+// section, as psql lists its variables.
+func names(v []varName) string {
+	var b strings.Builder
+	for _, n := range v {
+		b.WriteString(n.String())
+	}
+	return strings.TrimRightFunc(b.String(), unicode.IsSpace)
 }
 
 func buildConfigDir(configName string) (string, string) {
 	dir := `$HOME/.config/usql`
 	switch runtime.GOOS {
 	case "darwin":
-		dir = `$HOME/Library/Application Support`
+		dir = `$HOME/Library/Application Support/usql`
 	case "windows":
 		dir = `%AppData%\usql`
 	}
@@ -90,29 +86,89 @@ func (v varName) String() string {
 
 var varNames = []varName{
 	{
-		`ECHO_HIDDEN`,
+		`ROW_COUNT`,
+		`number of rows returned or affected by the last query, or 0 if it failed`,
+	},
+}
+
+// chartNames are the settings of \chart.
+var chartNames = []varName{
+	{
+		`path`,
+		`directory of the chart files, relative to the directory of the configuration file (default "charts")`,
+	},
+}
+
+// settingNames are the settings of the application, which \uset sets.
+var settingNames = []varName{
+	{
+		`echo_hidden`,
 		`if set, display internal queries executed by backslash commands; if set to "noexec", shows queries without execution`,
 	},
 	{
-		`ON_ERROR_STOP`,
+		`editor`,
+		`editor used by the \e, \ef, and \ev commands`,
+	},
+	{
+		`fetch_count`,
+		`the number of result rows to read and show at a time, 0 for all of them at once, as psql's FETCH_COUNT (default 0)`,
+	},
+	{
+		`on_error_stop`,
 		`stop batch execution after error`,
 	},
 	{
-		`PROMPT1`,
+		`pager`,
+		`name of external pager program`,
+	},
+	{
+		`prompt1`,
 		`specifies the standard ` + text.CommandName + ` prompt`,
 	},
 	{
-		`QUIET`,
+		`prompt2`,
+		`specifies the prompt used when a statement continues on another row`,
+	},
+	{
+		`quiet`,
 		`run quietly (same as -q option)`,
 	},
 	{
-		`ROW_COUNT`,
-		`number of rows returned or affected by last query, or 0`,
+		`show_host_information`,
+		`display host information when connecting to a database`,
+	},
+	{
+		`encoding`,
+		`encoding of a script read with -f, \i or from a pipe, such as windows-1252 or shift_jis (default utf-8)`,
+	},
+	{
+		`sslmode`,
+		`when set to 'retry', allows connections to attempt to reconnect when no ?sslmode= was specified on the url`,
+	},
+	{
+		`syntax_hl`,
+		`enable syntax highlighting of the input`,
+	},
+	{
+		`syntax_hl_format`,
+		`color depth of the highlighting [noop, terminal, terminal256, terminal16m]`,
+	},
+	{
+		`syntax_hl_override_bg`,
+		`keep the background of the terminal, and not the background of the highlighting style`,
+	},
+	{
+		`syntax_hl_style`,
+		`syntax highlighting style name`,
+	},
+	{
+		`term_graphics`,
+		`use the specified terminal graphics`,
 	},
 }
 
 var (
-	formatRE    = regexp.MustCompile(`^(unaligned|aligned|wrapped|html|asciidoc|latex|latex-longtable|troff-ms|csv|json|vertical)$`)
+	formatRE    = regexp.MustCompile(`^(unaligned|aligned|wrapped|html|asciidoc|latex|latex-longtable|troff-ms|csv|json|vertical|markdown)$`)
 	linestlyeRE = regexp.MustCompile(`^(ascii|old-ascii|unicode)$`)
 	borderRE    = regexp.MustCompile(`^(single|double)$`)
 )
@@ -148,11 +204,19 @@ var pvarNames = []varName{
 	},
 	{
 		`format`,
-		`set output format [unaligned, aligned, wrapped, vertical, html, asciidoc, csv, json, ...]`,
+		`set output format [unaligned, aligned, wrapped, vertical, html, asciidoc, csv, json, markdown, ...]`,
+	},
+	{
+		`header_align`,
+		`alignment of the column names in aligned, wrapped and markdown output [center, left, right, column] (default center)`,
 	},
 	{
 		`linestyle`,
 		`set the border line drawing style [ascii, old-ascii, unicode]`,
+	},
+	{
+		`json_indent`,
+		`number of spaces to indent JSON output, 0 for compact output [N, on, off] (default 0)`,
 	},
 	{
 		`null`,
@@ -164,7 +228,7 @@ var pvarNames = []varName{
 	},
 	{
 		`pager_min_lines`,
-		`minimum number of lines required in the output to use a pager, 0 to disable (default 0)`,
+		`number of lines the output must have before the pager starts, 0 for no minimum (default 0)`,
 	},
 	{
 		`pager`,
@@ -210,9 +274,17 @@ var pvarNames = []varName{
 		`unicode_header_linestyle`,
 		`set the style of Unicode line drawing [single, double]`,
 	},
+	{
+		`xheader_width`,
+		`maximum width of the header of a record in expanded output [full, column, page, N] (default full)`,
+	},
 }
 
 var envVarNames = []varName{
+	{
+		text.CommandUpper() + `_DSN`,
+		`DSN to open when the command line names none, removed from the environment after it is read`,
+	},
 	{
 		text.CommandUpper() + `_EDITOR, EDITOR, VISUAL`,
 		`editor used by the \e, \ef, and \ev commands`,
@@ -223,7 +295,7 @@ var envVarNames = []varName{
 	},
 	{
 		text.CommandUpper() + `_HISTORY`,
-		`alternative location for the command history file`,
+		`path of the history file (default the history file in the state directory)`,
 	},
 	{
 		text.CommandUpper() + `_PAGER, PAGER`,
@@ -235,65 +307,75 @@ var envVarNames = []varName{
 	},
 	{
 		text.CommandUpper() + `RC`,
-		`alternative location for the user's .usqlrc file`,
+		`path of the file that runs at start (default init.sql in the config directory)`,
 	},
 	{
 		text.CommandUpper() + `_SSLMODE, SSLMODE`,
 		`when set to 'retry', allows connections to attempt to reconnect when no ?sslmode= was specified on the url`,
 	},
 	{
-		`SYNTAX_HL`,
-		`enable syntax highlighting`,
-	},
-	{
-		`SYNTAX_HL_FORMAT`,
-		`chroma library formatter name`,
-	},
-	{
-		`SYNTAX_HL_STYLE`,
-		`chroma library style name (default "monokai")`,
-	},
-	{
-		`SYNTAX_HL_OVERRIDE_BG`,
-		`enables overriding the background color of the chroma styles`,
-	},
-	{
-		`TERM_GRAPHICS`,
+		text.CommandUpper() + `_TERM_GRAPHICS, TERM_GRAPHICS`,
 		`use the specified terminal graphics`,
 	},
 	{
-		`SHELL`,
-		`shell used by the \! command`,
+		text.CommandUpper() + `_SHELL, SHELL`,
+		`shell that runs the \! command, a backtick, \g |command, \o |command, the pager and the editor`,
 	},
 }
 
 const variableTpl = `List of specially treated variables
 
-%s variables:
+Each setting belongs to a section. \config and -O name a setting as
+SECTION.NAME, as in print.border. The configuration file holds each section
+as a map of names and values:
+  %[2]s%[3]s
+
+%[1]s script variables (section vars):
 Usage:
   %[1]s --set=NAME=VALUE
   or \set NAME VALUE inside %[1]s
 
-%[2]s
+%[6]s
 
-Display settings:
+Settings of %[1]s (section usql):
+Usage:
+  %[1]s --uset=NAME=VALUE
+  or \uset NAME VALUE inside %[1]s
+
+%[4]s
+
+Display settings (section print):
 Usage:
   %[1]s --pset=NAME[=VALUE]
   or \pset NAME [VALUE] inside %[1]s
 
-%[3]s
+%[5]s
+
+Chart settings (section charts):
+Usage:
+  %[1]s --option=charts.NAME=VALUE
+  or \config charts.NAME VALUE inside %[1]s
+
+%[7]s
+
+Environment of the commands that %[1]s runs, such as \!, the pager and the editor (section env):
+Usage:
+  %[1]s --option=env.NAME=VALUE
+  or \setenv NAME [VALUE] inside %[1]s
+
+Named connections (section connections):
+Usage:
+  %[1]s --cset=NAME=DSN
+  or \cset NAME [DSN] inside %[1]s
+  or \cset NAME DRIVER PARAMS... inside %[1]s
+
+Aliases, the meta commands of the user (section aliases):
+Usage:
+  NAME: TEXT under aliases: in %[2]s, which \NAME runs
 
 Environment variables:
 Usage:
   NAME=VALUE [NAME=VALUE] %[1]s ...
-  or \setenv NAME [VALUE] inside %[1]s
 
-%[4]s
-
-Connection variables:
-Usage:
-  %[1]s --cset NAME[=DSN]
-  or \cset NAME [DSN] inside %[1]s
-  or \cset NAME DRIVER PARAMS... inside %[1]s
-  or define in %[5]s%[6]s
+%[8]s
 `

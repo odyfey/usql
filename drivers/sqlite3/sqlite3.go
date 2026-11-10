@@ -1,32 +1,20 @@
 // Package sqlite3 defines and registers usql's SQLite3 driver. Requires CGO.
 //
 // See: https://github.com/mattn/go-sqlite3
-// Group: base
 package sqlite3
 
 import (
-	"context"
+	"errors"
+	"fmt"
 	"strconv"
 
 	"github.com/mattn/go-sqlite3" // DRIVER
 	"github.com/xo/usql/drivers"
-	"github.com/xo/usql/drivers/sqlite3/sqshared"
+	"github.com/xo/usql/drivers/sqwire/sqshared"
 )
 
 func init() {
 	drivers.Register("sqlite3", drivers.Driver{
-		AllowMultilineComments: true,
-		ForceParams: drivers.ForceQueryParameters([]string{
-			"loc", "auto",
-		}),
-		Version: func(ctx context.Context, db drivers.DB) (string, error) {
-			var ver string
-			err := db.QueryRowContext(ctx, `SELECT sqlite_version()`).Scan(&ver)
-			if err != nil {
-				return "", err
-			}
-			return "SQLite3 " + ver, nil
-		},
 		Err: func(err error) (string, string) {
 			if e, ok := err.(sqlite3.Error); ok {
 				return strconv.Itoa(int(e.Code)), e.Error()
@@ -37,8 +25,16 @@ func init() {
 			}
 			return code, msg
 		},
-		ConvertBytes:      sqshared.ConvertBytes,
-		NewMetadataReader: sqshared.NewMetadataReader,
-		Copy:              drivers.CopyWithInsert(func(int) string { return "?" }),
+		// psql's layout, with the primary result code as the code, and its
+		// name and the extended code in DETAIL
+		ErrVerbose: func(err error, _ string) string {
+			var e sqlite3.Error
+			if !errors.As(err, &e) {
+				return ""
+			}
+			detail := fmt.Sprintf("%s, extended code %d", e.Code.Error(), int(e.ExtendedCode))
+			return drivers.Verbose(strconv.Itoa(int(e.Code)), e.Error(), [2]string{"DETAIL", detail})
+		},
+		ConvertBytes: sqshared.ConvertBytes,
 	})
 }

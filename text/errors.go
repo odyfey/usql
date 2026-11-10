@@ -21,6 +21,14 @@ var (
 	ErrPasswordAttemptsExhausted = errors.New(`password attempts exhausted`)
 	// ErrSingleTransactionCannotBeUsedWithInteractiveMode is the single transaction cannot be used with interactive mode error.
 	ErrSingleTransactionCannotBeUsedWithInteractiveMode = errors.New(`--single-transaction cannot be used with interactive mode`)
+	// ErrDumpWithCommands is the error for --dump with -c or -f.
+	ErrDumpWithCommands = errors.New(`--dump cannot be used with -c or -f`)
+	// ErrDumpWithSingleTransaction is the error for --dump with
+	// --single-transaction.
+	ErrDumpWithSingleTransaction = errors.New(`--dump cannot be used with --single-transaction`)
+	// ErrDumpOptionWithoutDump is the error for an option of --dump without
+	// --dump.
+	ErrDumpOptionWithoutDump = errors.New(`the options of a dump need --dump`)
 	// ErrNoEditorDefined is the no editor defined error.
 	ErrNoEditorDefined = errors.New(`no editor defined`)
 	// ErrUnknownCommand is the unknown command error.
@@ -45,8 +53,11 @@ var (
 	ErrInvalidValue = errors.New(`invalid value`)
 	// ErrTooManyRows is the too many rows error.
 	ErrTooManyRows = errors.New(`too many rows`)
+	// ErrNoRowsGset is the error for \gset with a query that returns no
+	// rows, as psql words it.
+	ErrNoRowsGset = errors.New(`no rows returned for \gset`)
 	// ErrInvalidFormatType is the invalid format type error.
-	ErrInvalidFormatType = errors.New(`\pset: allowed formats are unaligned, aligned, wrapped, html, asciidoc, latex, latex-longtable, troff-ms, json, csv`)
+	ErrInvalidFormatType = errors.New(`\pset: allowed formats are unaligned, aligned, wrapped, html, asciidoc, latex, latex-longtable, troff-ms, json, csv, markdown`)
 	// ErrInvalidFormatPagerType is the invalid format pager error.
 	ErrInvalidFormatPagerType = errors.New(`\pset: allowed pager values are on, off, always`)
 	// ErrInvalidFormatExpandedType is the invalid format expanded error.
@@ -59,6 +70,8 @@ var (
 	ErrInvalidTimezoneLocation = errors.New(`\pset: invalid timezone location`)
 	// ErrGraphicsNotSupported is the graphics not supported error.
 	ErrGraphicsNotSupported = errors.New(`\chart: graphics not supported in terminal`)
+	// ErrChartsNotSupported is the charts not built in error.
+	ErrChartsNotSupported = errors.New(`\chart: this build of usql has no chart renderer (its build tags left out charts)`)
 	// ErrNoNumericColumns is the no numeric columns error.
 	ErrNoNumericColumns = errors.New(`\chart: no numeric columns found`)
 	// ErrInvalidQuotedString is the invalid quoted string error.
@@ -77,12 +90,47 @@ var (
 	ErrWrongNumberOfArguments = errors.New(`wrong number of arguments`)
 	// ErrUnknownFileType is the unknown file type error.
 	ErrUnknownFileType = errors.New(`unknown file type`)
+	// ErrRestricted is the error for a meta command in restricted mode.
+	ErrRestricted = errors.New(`backslash commands are restricted: only \unrestrict is allowed`)
+	// ErrNotRestricted is the error for \unrestrict outside restricted mode.
+	ErrNotRestricted = errors.New(`not currently in restricted mode`)
+	// ErrWrongRestrictKey is the error for \unrestrict with another key.
+	ErrWrongRestrictKey = errors.New(`wrong key`)
+	// ErrPasswordForward is the error when a password is asked for a URL that
+	// dbfwd opens, which reads the password where the database runs.
+	ErrPasswordForward = errors.New(`a forwarded connection reads its password where the database runs, so -W does not apply`)
 	// ErrNamedConnectionIsNotAURL is the named connection is not a url error.
 	ErrNamedConnectionIsNotAURL = errors.New(`named connection is not a url`)
-	// ErrInvalidConfig is the invalid config error.
-	ErrInvalidConfig = errors.New(`invalid config`)
-	// ErrIfEscaped is the if escaped error.
-	ErrIfEscaped = errors.New(`\if escaped`)
-	// ErrEndIfNoMatchingIf is the endif no matching if error.
+	// ErrConfigNotAMap is the error of a section of the configuration file
+	// that is not a map.
+	// ErrInvalidXheaderWidth is the error of a value of xheader_width that
+	// psql refuses.
+	ErrInvalidXheaderWidth = errors.New(`allowed xheader_width values are "full" (default), "column", "page", or a number specifying the exact width`)
+	ErrConfigNotAMap       = errors.New(`not a map of names and values`)
+	// ErrConfigNotAValue is the error of a setting of the configuration file
+	// that is a list or a map.
+	ErrConfigNotAValue = errors.New(`not a value: a setting takes a string, a number or a Boolean`)
+	// ErrAliasConfigOnly is the error of setting an alias other than in the
+	// configuration file.
+	ErrAliasConfigOnly = errors.New(`only the configuration file sets an alias`)
+	// ErrAliasArguments is the error of an alias that is given arguments.
+	ErrAliasArguments = errors.New(`an alias takes no arguments`)
+	// ErrAliasTooDeep is the error of aliases that run each other too many
+	// times.
+	ErrAliasTooDeep = errors.New(`aliases run each other too many times`)
+	// ErrIfEscaped is the error when Ctrl-C at a terminal leaves the innermost
+	// \if block, as in psql.
+	ErrIfEscaped = errors.New(`\if: escaped`)
+	// ErrElifNoMatchingIf is the error of an \elif outside an \if block.
+	ErrElifNoMatchingIf = errors.New(`\elif: no matching \if`)
+	// ErrElseNoMatchingIf is the error of an \else outside an \if block.
+	ErrElseNoMatchingIf = errors.New(`\else: no matching \if`)
+	// ErrEndIfNoMatchingIf is the error of an \endif outside an \if block.
 	ErrEndIfNoMatchingIf = errors.New(`\endif: no matching \if`)
+	// ErrElifAfterElse is the error of an \elif after the \else of its block.
+	ErrElifAfterElse = errors.New(`\elif: cannot occur after \else`)
+	// ErrElseAfterElse is the error of a second \else in a block.
+	ErrElseAfterElse = errors.New(`\else: cannot occur after \else`)
+	// ErrUnclosedIf is the error of an input that ends inside an \if block.
+	ErrUnclosedIf = errors.New(`reached EOF without finding closing \endif(s)`)
 )

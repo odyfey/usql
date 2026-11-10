@@ -2,8 +2,6 @@
 package handler
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -18,7 +16,6 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -26,24 +23,23 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/alecthomas/chroma/v2"
-	"github.com/alecthomas/chroma/v2/formatters"
-	"github.com/alecthomas/chroma/v2/styles"
 	"github.com/go-git/go-billy/v5"
+	"github.com/kenshaw/rasterm"
+	"github.com/mattn/go-isatty"
+	"github.com/xo/dbfwd"
+	"github.com/xo/dbmeta"
 	"github.com/xo/dburl"
-	"github.com/xo/dburl/passfile"
-	"github.com/xo/echartsgoja"
-	"github.com/xo/resvg"
+	"github.com/xo/rline"
 	"github.com/xo/tblfmt"
 	"github.com/xo/usql/drivers"
-	"github.com/xo/usql/drivers/completer"
-	"github.com/xo/usql/drivers/metadata"
 	"github.com/xo/usql/env"
+	"github.com/xo/usql/feed"
+	"github.com/xo/usql/highlight"
 	"github.com/xo/usql/metacmd"
 	"github.com/xo/usql/metacmd/charts"
-	"github.com/xo/usql/rline"
-	"github.com/xo/usql/stmt"
-	ustyles "github.com/xo/usql/styles"
+	"github.com/xo/usql/metacmd/complete"
+	"github.com/xo/usql/metacmd/describe"
+	"github.com/xo/usql/pager"
 	"github.com/xo/usql/text"
 )
 
@@ -56,8 +52,21 @@ import (
 // statements, and handles backslash (\) meta commands encountered in the input
 // stream.
 type Handler struct {
-	// l is the readline handler.
-	l rline.IO
+	// l is the session of the line editor. The handler writes through it, and
+	// reads passwords and answers to \prompt with it.
+	l *rline.Prompt
+	// src is the input of the handler: the line editor at a terminal, a
+	// script, a pipe, or an included file.
+	src *feed.Source
+	// hl draws the input in color, and is nil unless the handler is interactive
+	hl *highlight.Highlighter
+	// iactive is set when src is the line editor at a terminal.
+	iactive bool
+	// historyWarned is set once the handler has said that the history file
+	// cannot be read or written.
+	historyWarned bool
+	// reading is set while \prompt reads an answer from the line editor.
+	reading bool
 	// user is the user.
 	user *user.User
 	// wd is the working directory.
@@ -70,56 +79,143 @@ type Handler struct {
 	timing bool
 	// singleLineMode is single line mode.
 	singleLineMode bool
-	// buf is the query statement buffer.
-	buf *stmt.Stmt
+	// aliasDepth is the number of aliases that are running, one inside the
+	// other.
+	aliasDepth int
+	// quit is set when \q ran inside an alias, so that the handler stops.
+	quit bool
+	// buf is psql's query buffer.
+	buf feed.Buffer
+	// cond is the stack of \if blocks of src. A branch that does not run
+	// sends no statement, and runs no meta command other than \if, \elif,
+	// \else and \endif.
+	cond conds
 	// lastExec is the last executed query statement.
 	lastExec string
-	// lastExecPrefix is the last executed query statement prefix.
-	lastExecPrefix string
-	// lastPrint is the last executed printable query statement.
-	lastPrint string
 	// lastRaw is the last executed raw query statement.
 	lastRaw string
-	// batch indicates a batch has been started.
-	batch bool
-	// batchEnd is the batch end string.
-	batchEnd string
+	// restrictKey is the key of \restrict. While it is set, no meta command
+	// runs but \unrestrict with the same key.
+	restrictKey string
+	// lastErr is the error of the last statement that failed, and
+	// lastErrQuery the statement, which \errverbose shows.
+	lastErr      error
+	lastErrQuery string
+	// database is the current database that dbmeta reports, which the
+	// prompt's %/ shows, and which USE changes.
+	database sql.Null[string]
 	// bind are bound values for that will be used for statement execution.
 	bind []interface{}
-	// u is the active connection information.
+	// u is the active connection information. For a forward, it is the URL
+	// of the local end, and it holds the password.
 	u *dburl.URL
-	// db is the active database connection.
+	// fwd is the forward that dbfwd runs for the connection, or nil.
+	fwd *dbfwd.Forward
+	// fwdURL is the URL that fwd resolved, such as k+cnpg://pg.prod/app. It
+	// holds no password.
+	fwdURL *dburl.URL
+	// fwdDSN is the text of fwdURL, which \c with no argument opens again.
+	fwdDSN string
+	// db is the pool of the active database connection.
 	db *sql.DB
+	// conn is the one connection of db that the statements of the session
+	// run on, taken when the session starts and again after it is lost.
+	conn *drivers.Session
+	// meta reads the structure of the database, and is built the first time
+	// it is needed.
+	meta *dbmeta.Meta
 	// tx is the active transaction, if any.
 	tx *sql.Tx
 	// out file or pipe
 	out io.WriteCloser
+	// page is where the entry that runs now writes its output. Stdout makes it
+	// the first time an entry writes, and endPage closes it when the entry
+	// ends.
+	page *pager.Writer
 }
 
-// New creates a new input handler.
-func New(l rline.IO, user *user.User, wd string, charts billy.Filesystem, nopw bool) *Handler {
-	f, iactive := l.Next, l.Interactive()
-	if iactive {
-		f = func() ([]rune, error) {
-			// next line
-			r, err := l.Next()
-			if err != nil {
-				return nil, err
-			}
-			// save history
-			_ = l.Save(string(r))
-			return r, nil
-		}
-	}
+// New returns a handler that reads its input from r, and talks to the user
+// through l. When r is l and l is a terminal, the handler is interactive: it
+// shows a prompt, completes, and reads whole entries.
+func New(l *rline.Prompt, r feed.LineReader, user *user.User, wd string, charts billy.Filesystem, nopw bool) (*Handler, error) {
 	h := &Handler{
-		l:      l,
-		user:   user,
-		wd:     wd,
-		charts: charts,
-		nopw:   nopw,
-		buf:    stmt.New(f),
+		l:       l,
+		iactive: l.Interactive() && r == feed.LineReader(l),
+		user:    user,
+		wd:      wd,
+		charts:  charts,
+		nopw:    nopw,
 	}
-	return h
+	var prompt func() string
+	if h.iactive {
+		prompt = h.prompt
+		l.SetCompleter(complete.New(complete.WithCommands(metacmd.Completions()), complete.WithConnStrings(h.connStrings()), complete.WithKeywords(h.keywords)))
+		var err error
+		if h.hl, err = highlight.New(l); err != nil {
+			return nil, err
+		}
+		l.SetHighlighter(h.hl)
+	}
+	var err error
+	if h.src, err = feed.NewSource(r, drivers.Language(nil), prompt); err != nil {
+		return nil, err
+	}
+	// at a terminal, help, quit and exit typed alone need no ';'
+	if h.iactive {
+		h.src.SetAlone(isHelpQuitExit)
+	}
+	return h, nil
+}
+
+// setLanguage sets the grammar of the dialect of the connection on the source of
+// the input, and on the highlighter, which reads the same statements.
+func (h *Handler) setLanguage() error {
+	lang := drivers.Language(h.u)
+	if err := h.src.SetLanguage(lang); err != nil {
+		return err
+	}
+	if h.hl == nil {
+		return nil
+	}
+	var dialect string
+	if h.u != nil {
+		dialect = h.u.Dialect
+	}
+	return h.hl.SetDialect(dialect, lang)
+}
+
+// prompt returns the prompt for the next entry, and sets the marker that the
+// line editor draws on the rows after the first.
+func (h *Handler) prompt() string {
+	h.l.SetPrompt("", h.render(env.Setting("prompt2"), true))
+	return h.render(env.Setting("prompt1"), false)
+}
+
+// Continue reports whether an entry typed at the terminal needs more input. It
+// is the function that the line editor's WithContinue calls, with the whole
+// entry typed so far.
+func (h *Handler) Continue(text string) bool {
+	if h.reading {
+		return false
+	}
+	if h.buf.Empty() && isHelpQuitExit(text) {
+		return false
+	}
+	items, err := h.src.Parser().Parse(text)
+	if err != nil {
+		return false
+	}
+	return !feed.Finished(items)
+}
+
+// isHelpQuitExit reports whether s is only help, quit or exit, which may end
+// with a ';', as psql reads them.
+func isHelpQuitExit(s string) bool {
+	switch strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s), ";")) {
+	case text.HelpPrefix, text.QuitPrefix, text.ExitPrefix:
+		return true
+	}
+	return false
 }
 
 // GetTiming gets the timing toggle.
@@ -132,316 +228,245 @@ func (h *Handler) SetTiming(timing bool) {
 	h.timing = timing
 }
 
-// SetSingleLineMode sets the single line mode toggle.
-func (h *Handler) SetSingleLineMode(singleLineMode bool) {
-	h.singleLineMode = singleLineMode
-}
-
-// Run executes queries and commands.
+// Run reads the input, and runs each statement and meta command in turn, until
+// the input ends.
 func (h *Handler) Run() error {
-	stdout, stderr, iactive := h.l.Stdout(), h.l.Stderr(), h.l.Interactive()
 	// display welcome info
-	if iactive && env.Get("QUIET") == "off" {
+	if h.iactive && env.Setting("quiet") == "off" {
 		// logo
 		if typ := env.TermGraphics(); typ.Available() {
-			if err := typ.Encode(stdout, text.Logo); err != nil {
+			if err := typ.Encode(h.l, text.Logo); err != nil {
 				return err
 			}
 		}
 		// welcome text
-		fmt.Fprintln(stdout, text.WelcomeDesc)
-		fmt.Fprintln(stdout)
+		fmt.Fprintln(h.l, text.WelcomeDesc)
+		fmt.Fprintln(h.l)
 	}
-	var cmd string
-	var paramstr string
-	var err error
-	var opt metacmd.Option
-	var cont bool
+	return h.loop()
+}
+
+// loop reads the input, and runs each statement and meta command in turn,
+// until the input ends.
+func (h *Handler) loop() error {
+	stderr := h.l.Stderr()
+	// the output of the last entry goes to the pager or the terminal before
+	// the handler stops
+	defer h.endPage()
 	var lastErr error
-	var execute bool
 	for {
-		execute = false
-		// set prompt
-		if iactive {
-			h.l.Prompt(h.Prompt(env.Get("PROMPT1")))
+		// the pager of the last entry must exit before the next line is read
+		h.endPage()
+		h.checkHistory(stderr)
+		// the keys typed while rasterm asked the terminal whether it draws
+		// images go to the line editor, before the terminal
+		if b := rasterm.PendingInput(); h.iactive && len(b) != 0 {
+			h.l.PushInput(b)
 		}
-		// read next statement/command
-		switch cmd, paramstr, err = h.buf.Next(env.Untick(h.user, env.Vars(), false)); {
-		case h.singleLineMode && err == nil:
-			execute = h.buf.Len != 0
-		case err == rline.ErrInterrupt:
-			h.buf.Reset(nil)
+		it, err := h.src.Next()
+		switch {
+		case errors.Is(err, rline.ErrInterrupted):
+			h.buf.Reset()
+			h.src.Reset()
+			// Ctrl-C also leaves the innermost \if block, as in psql
+			if len(h.cond) != 0 {
+				h.cond = h.cond[:len(h.cond)-1]
+				fmt.Fprintln(stderr, "error:", text.ErrIfEscaped)
+			}
 			continue
-		case err == io.EOF:
+		case errors.Is(err, io.EOF):
+			// input that is not typed, from -c, -f, a pipe or \i, sends what
+			// is left in the buffer at its end, as psql does, unless the
+			// input ends in a branch that does not run
+			// The end of an alias sends nothing, so that an alias can
+			// add to the query buffer, as typed text does.
+			if (h.singleLineMode || !h.iactive) && h.aliasDepth == 0 && !h.buf.Empty() && h.cond.active() {
+				stop, err := h.send(h.Stdout(), stderr, metacmd.Option{})
+				if err != nil {
+					lastErr = err
+				}
+				if stop {
+					return err
+				}
+			}
+			// each input closes its own \if blocks. psql reports the error
+			// and keeps its exit status, unless on_error_stop is on.
+			if len(h.cond) != 0 {
+				fmt.Fprintln(stderr, "error:", text.ErrUnclosedIf)
+				if env.Setting("on_error_stop") == "on" && !h.iactive {
+					return WrapErr("", text.ErrUnclosedIf)
+				}
+			}
 			return lastErr
 		case err != nil:
 			return err
-		case cmd != "":
-			opt, cont, lastErr = h.apply(stdout, stderr, strings.TrimPrefix(cmd, `\`), paramstr)
 		}
-		if cont {
-			continue
-		}
-		// help, exit, quit intercept
-		if iactive && len(h.buf.Buf) >= 4 {
-			i, first := lastIndex(h.buf.Buf, '\n'), false
-			if i == -1 {
-				i, first = 0, true
-			}
-			if s := strings.ToLower(helpQuitExitRE.FindString(string(h.buf.Buf[i:]))); s != "" {
-				switch s {
-				case "help":
-					s = text.HelpDescShort
-					if first {
-						s = text.HelpDesc
-						h.buf.Reset(nil)
-					}
-				case "quit", "exit":
-					s = text.QuitDesc
-					if first {
-						return nil
-					}
-				}
-				fmt.Fprintln(stdout, s)
-			}
-		}
-		// quit
-		if opt.Quit {
-			if h.out != nil {
-				h.out.Close()
-			}
-			return nil
-		}
-		// execute buf
-		if execute || h.buf.Ready() || opt.Exec != metacmd.ExecNone {
-			// intercept batch query
-			if h.u != nil {
-				typ, end, batch := drivers.IsBatchQueryPrefix(h.u, h.buf.Prefix)
-				switch {
-				case h.batch && batch:
-					err = fmt.Errorf("cannot perform %s in existing batch", typ)
-					lastErr = WrapErr(h.buf.String(), err)
-					fmt.Fprintln(stderr, "error:", err)
+		var opt metacmd.Option
+		switch it.Kind {
+		case feed.Statement:
+			if h.iactive && h.buf.Empty() && isHelpQuitExit(it.Text) {
+				if strings.EqualFold(strings.TrimSuffix(strings.TrimSpace(it.Text), ";"), text.HelpPrefix) {
+					fmt.Fprintln(h.Stdout(), text.HelpDesc)
 					continue
-				// cannot use \g* while accumulating statements for batch queries
-				case h.batch && typ != h.batchEnd && opt.Exec != metacmd.ExecNone:
-					err = errors.New("cannot force batch execution")
-					lastErr = WrapErr(h.buf.String(), err)
-					fmt.Fprintln(stderr, "error:", err)
-					continue
-				case batch:
-					h.batch, h.batchEnd = true, end
-				case h.batch:
-					var lend string
-					if len(h.lastExec) != 0 {
-						lend = "\n"
-					}
-					// append to last
-					h.lastExec += lend + h.buf.String()
-					h.lastExecPrefix = h.buf.Prefix
-					h.lastPrint += lend + h.buf.PrintString()
-					h.lastRaw += lend + h.buf.RawString()
-					h.buf.Reset(nil)
-					// break
-					if h.batchEnd != typ {
-						continue
-					}
-					h.lastExecPrefix = h.batchEnd
-					h.batch, h.batchEnd = false, ""
 				}
+				return nil
 			}
-			if h.buf.Len != 0 {
-				h.lastExec, h.lastExecPrefix, h.lastPrint, h.lastRaw = h.buf.String(), h.buf.Prefix, h.buf.PrintString(), h.buf.RawString()
-				h.buf.Reset(nil)
-			}
-			// log.Printf(">> PROCESS EXECUTE: (%s) `%s`", h.lastPrefix, h.last)
-			if !h.batch && h.lastExec != "" && h.lastExec != ";" {
-				// force a transaction for batched queries for certain drivers
-				var forceBatch bool
-				if h.u != nil {
-					_, _, forceBatch = drivers.IsBatchQueryPrefix(h.u, stmt.FindPrefix(h.lastExec, true, true, true))
-					forceBatch = forceBatch && drivers.BatchAsTransaction(h.u)
+			// a branch that does not run drops its statements, so they do
+			// not join the query buffer, and their variables are not
+			// expanded
+			if !h.cond.active() {
+				if h.iactive && it.Terminated {
+					fmt.Fprintln(stderr, text.QueryIgnoredUseEndIf)
 				}
-				// execute
-				out := stdout
+				continue
+			}
+			h.buf.Add(it)
+			if !it.Terminated {
+				continue
+			}
+		case feed.Command:
+			var cont bool
+			opt, cont, lastErr = h.apply(h.Stdout(), stderr, it)
+			switch {
+			case cont:
+				continue
+			case opt.Quit:
+				if h.aliasDepth != 0 {
+					h.quit = true
+					return nil
+				}
 				if h.out != nil {
-					out = h.out
+					h.out.Close()
 				}
-				ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-				if err = h.Execute(ctx, out, opt, h.lastExecPrefix, h.lastExec, forceBatch, h.unbind()...); err != nil {
-					lastErr = WrapErr(h.lastExec, err)
-					if env.Get("ON_ERROR_STOP") == "on" {
-						if iactive {
-							fmt.Fprintln(stderr, "error:", err)
-							h.buf.Reset([]rune{}) // empty the buffer so no other statements are run
-							continue
-						} else {
-							stop()
-							return err
-						}
-					} else {
-						fmt.Fprintln(stderr, "error:", err)
-					}
-				}
-				stop()
+				return nil
+			case opt.Exec == metacmd.ExecNone:
+				continue
 			}
+		}
+		stop, err := h.send(h.Stdout(), stderr, opt)
+		if err != nil {
+			lastErr = err
+		}
+		if stop {
+			return err
 		}
 	}
 }
 
-// apply applies the command against the handler.
-func (h *Handler) apply(stdout, stderr io.Writer, cmd, paramstr string) (metacmd.Option, bool, error) {
-	// cmd = strings.TrimPrefix(cmd, `\`)
-	params := stmt.NewParams(paramstr)
-	// decode
-	f, err := metacmd.Decode(cmd, params)
+// send sends the query buffer, or the last query when the buffer is empty, as
+// \g does. It returns the error of the statement, which it has already
+// written out, and reports whether the handler must stop, as on_error_stop
+// asks outside a terminal.
+func (h *Handler) send(stdout, stderr io.Writer, opt metacmd.Option) (bool, error) {
+	exp, raw := h.buf.Expand(h.Lookup), h.buf.Raw()
+	if !h.buf.Empty() {
+		h.lastExec, h.lastRaw = exp, raw
+		h.buf.Reset()
+	}
+	if h.lastExec == "" || h.lastExec == ";" {
+		return false, nil
+	}
+	out := stdout
+	switch {
+	case h.out != nil:
+		out = h.out
+	case opt.Exec == metacmd.ExecWatch:
+		// \watch writes until it is interrupted, so a pager would never see
+		// the end of its output
+		out = h.l
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	err := h.Execute(ctx, out, opt, h.lastExec, h.unbind()...)
+	if err == nil {
+		return false, nil
+	}
+	// the error goes after the output, not into the middle of it
+	h.endPage()
+	fmt.Fprintln(stderr, "error:", err)
+	err = WrapErr(h.lastExec, err)
+	if env.Setting("on_error_stop") == "on" {
+		if h.iactive {
+			// empty the input, so that no other statement runs
+			h.buf.Reset()
+			h.src.Reset()
+			return false, err
+		}
+		return true, err
+	}
+	return false, err
+}
+
+// apply runs the meta command it. It reports whether the command failed, so
+// that the handler goes on to the next item.
+func (h *Handler) apply(stdout, stderr io.Writer, it feed.Item) (metacmd.Option, bool, error) {
+	cmd := it.Name
+	// pg_dump writes \restrict on the first line of a dump, so that a meta
+	// command in the data of the dump cannot run, as in psql
+	if h.restrictKey != "" && cmd != "unrestrict" {
+		fmt.Fprintln(stderr, "error:", text.ErrRestricted)
+		return metacmd.Option{}, true, WrapErr(cmd, text.ErrRestricted)
+	}
+	f, err := metacmd.Decode(it)
+	// an alias of the configuration file has a name that no command has
+	if body, ok := env.Vars().Alias(cmd); ok && errors.Is(err, text.ErrUnknownCommand) {
+		if !h.cond.active() {
+			if h.iactive {
+				fmt.Fprintf(stderr, text.CommandIgnoredUseEndIf+"\n", cmd)
+			}
+			return metacmd.Option{}, true, nil
+		}
+		err := h.runAlias(stderr, body, it)
+		if h.quit {
+			h.quit = false
+			return metacmd.Option{Quit: true}, false, err
+		}
+		return metacmd.Option{}, true, WrapErr(cmd, err)
+	}
 	if err != nil {
 		switch err = WrapErr(cmd, err); {
-		case err == text.ErrUnknownCommand:
+		case errors.Is(err, text.ErrUnknownCommand):
 			fmt.Fprintln(stderr, fmt.Sprintf(text.InvalidCommand, cmd))
-		case err == text.ErrMissingRequiredArgument:
+		case errors.Is(err, text.ErrMissingRequiredArgument):
 			fmt.Fprintln(stderr, fmt.Sprintf(text.MissingRequiredArg, cmd))
 		default:
 			fmt.Fprintln(stderr, "error:", err)
 		}
 		return metacmd.Option{}, true, err
 	}
-	// run
-	opt, err := f(h)
-	if err != nil && err != rline.ErrInterrupt {
+	// a branch that does not run runs no meta command but \if, \elif, \else
+	// and \endif. psql reports an unknown command there too.
+	if !h.cond.active() && !isConditional(cmd) {
+		if h.iactive {
+			fmt.Fprintf(stderr, text.CommandIgnoredUseEndIf+"\n", cmd)
+		}
+		return metacmd.Option{}, true, nil
+	}
+	opt, unread, err := f(h)
+	if err != nil && !errors.Is(err, rline.ErrInterrupted) {
+		// the error goes after the output, not into the middle of it
+		h.endPage()
 		fmt.Fprintln(stderr, "error:", err)
 		return metacmd.Option{}, true, WrapErr(cmd, err)
 	}
-loop:
-	// print unused command parameters
-	for {
-		switch arg, ok, err := params.Arg(); {
-		case err != nil:
-			fmt.Fprintln(stderr, "error:", err)
-		case !ok:
-			break loop
-		default:
-			fmt.Fprintln(stdout, fmt.Sprintf(text.ExtraArgumentIgnored, cmd, arg))
-		}
+	for _, arg := range unread {
+		fmt.Fprintln(stdout, fmt.Sprintf(text.ExtraArgumentIgnored, cmd, arg))
 	}
 	return opt, false, nil
 }
 
-// outputHighlighter returns s as a highlighted string, based on the current
-// buffer and syntax highlighting settings.
-func (h *Handler) outputHighlighter(s string) string {
-	// bail when string is empty (ie, contains no printable, non-space
-	// characters) or if syntax highlighting is not enabled
-	if empty(s) || env.Get("SYNTAX_HL") != "true" {
-		return s
-	}
-	// count end lines
-	var endl string
-	if m := lineendRE.FindStringSubmatch(s); m != nil {
-		s = strings.TrimSuffix(s, m[0])
-		endl += m[0]
-	}
-	// leading whitespace
-	var leading string
-	// capture current query statement buffer
-	orig := h.buf.RawString()
-	full := orig
-	if full != "" {
-		full += "\n"
-	} else {
-		// get leading whitespace
-		if i := strings.IndexFunc(s, func(r rune) bool {
-			return !isSpaceOrControl(r)
-		}); i != -1 {
-			leading = s[:i]
-		}
-	}
-	full += s
-	// setup statement parser
-	st := drivers.NewStmt(h.u, func() func() ([]rune, error) {
-		y := strings.Split(orig, "\n")
-		if y[0] == "" {
-			y[0] = s
-		} else {
-			y = append(y, s)
-		}
-		return func() ([]rune, error) {
-			if len(y) > 0 {
-				z := y[0]
-				y = y[1:]
-				return []rune(z), nil
-			}
-			return nil, io.EOF
-		}
-	}())
-	// accumulate all "active" statements in buffer, breaking either at
-	// EOF or when a \ cmd has been encountered
-	var err error
-	var cmd, final string
-loop:
-	for {
-		cmd, _, err = st.Next(env.Untick(h.user, env.Vars(), false))
-		switch {
-		case err != nil && err != io.EOF:
-			return s + endl
-		case err == io.EOF:
-			break loop
-		}
-		if st.Ready() || cmd != "" {
-			final += st.RawString()
-			st.Reset(nil)
-			// grab remaining whitespace to add to final
-			l := len(final)
-			// find first non empty character
-			if i := strings.IndexFunc(full[l:], func(r rune) bool {
-				return !isSpaceOrControl(r)
-			}); i != -1 {
-				final += full[l : l+i]
-			}
-		}
-	}
-	if !st.Ready() && cmd == "" {
-		final += st.RawString()
-	}
-	final = leading + final
-	// determine whatever is remaining after "active"
-	var remaining string
-	if fnl := len(final); fnl < len(full) {
-		remaining = full[fnl:]
-	}
-	// this happens when a read line is empty and/or has only
-	// whitespace and a \ cmd
-	if s == remaining {
-		return s + endl
-	}
-	// highlight entire final accumulated buffer
-	b := new(bytes.Buffer)
-	if err := h.Highlight(b, final); err != nil {
-		return s + endl
-	}
-	colored := b.String()
-	// return only last line plus whatever remaining string (ie, after
-	// a \ cmd) and the end line count
-	ss := strings.Split(colored, "\n")
-	return lastcolor(colored) + ss[len(ss)-1] + remaining + endl
-}
-
 // Execute executes a query against the connected database.
-func (h *Handler) Execute(ctx context.Context, w io.Writer, opt metacmd.Option, prefix, sqlstr string, forceTrans bool, bind ...interface{}) error {
+func (h *Handler) Execute(ctx context.Context, w io.Writer, opt metacmd.Option, sqlstr string, bind ...interface{}) error {
 	if h.db == nil {
 		return text.ErrNotConnected
 	}
-	// determine type and pre process string
-	prefix, sqlstr, qtyp, err := drivers.Process(h.u, prefix, sqlstr)
-	if err != nil {
-		return drivers.WrapErr(h.u.Driver, err)
+	// no statement reaches a database whose forward is lost
+	if err := h.forwardLost(); err != nil {
+		return err
 	}
-	// start a transaction if forced
-	if forceTrans {
-		if err = h.BeginTx(ctx, nil); err != nil {
-			return err
-		}
-	}
+	// the command tag, the statement to send, and whether it returns rows,
+	// from dbmeta
+	prefix, sqlstr, qtyp := drivers.Process(h.u, sqlstr)
 	f := h.doExecSingle
 	switch opt.Exec {
 	case metacmd.ExecExec:
@@ -452,24 +477,155 @@ func (h *Handler) Execute(ctx context.Context, w io.Writer, opt metacmd.Option, 
 		f = h.doExecWatch
 	case metacmd.ExecChart:
 		f = h.doExecChart
+	case metacmd.ExecDescribe:
+		f = h.doExecDescribe
 	}
-	if err = drivers.WrapErr(h.u.Driver, f(ctx, w, opt, prefix, sqlstr, qtyp, bind)); err != nil {
-		if forceTrans {
-			defer h.tx.Rollback()
-			h.tx = nil
-		}
-		return err
+	err := f(ctx, w, opt, prefix, sqlstr, qtyp, bind)
+	// a driver says that the connection is bad only before the statement
+	// ran, so it runs once more on a new connection, as database/sql runs a
+	// statement of its pool
+	if h.lost(err) {
+		fmt.Fprintln(h.l.Stderr(), text.ConnectionReset)
+		err = f(ctx, w, opt, prefix, sqlstr, qtyp, bind)
+		h.lost(err)
 	}
-	if forceTrans {
-		return h.Commit()
+	// USE chooses another database, which the prompt shows
+	if err == nil && strings.EqualFold(prefix, "USE") {
+		h.readDatabase(ctx)
 	}
+	// a forward that is lost explains the error of the driver
+	if lost := h.forwardLost(); err != nil && lost != nil {
+		return lost
+	}
+	if err = drivers.WrapErr(h.u.SchemeName, err); err != nil {
+		h.lastErr, h.lastErrQuery = err, sqlstr
+	}
+	return err
+}
+
+// Restrict enters restricted mode, as \restrict does: no meta command runs
+// until \unrestrict gives the same key.
+func (h *Handler) Restrict(key string) error {
+	if key == "" {
+		return text.ErrMissingRequiredArgument
+	}
+	h.restrictKey = key
 	return nil
 }
 
-// Reset resets the handler's query statement buffer.
-func (h *Handler) Reset(r []rune) {
-	h.buf.Reset(r)
-	h.lastExec, h.lastExecPrefix, h.lastPrint, h.lastRaw, h.batch, h.batchEnd = "", "", "", "", false, ""
+// Unrestrict leaves restricted mode when key is the key of \restrict.
+func (h *Handler) Unrestrict(key string) error {
+	switch {
+	case h.restrictKey == "":
+		return text.ErrNotRestricted
+	case key == "":
+		return text.ErrMissingRequiredArgument
+	case key != h.restrictKey:
+		return text.ErrWrongRestrictKey
+	}
+	h.restrictKey = ""
+	return nil
+}
+
+// LastError returns the error of the last statement that failed, and the
+// statement, or nil when none failed.
+func (h *Handler) LastError() (error, string) {
+	return h.lastErr, h.lastErrQuery
+}
+
+// checkHistory says once, at a terminal, that the history file could not be
+// read or written, as the line editor goes on without it and says nothing.
+func (h *Handler) checkHistory(w io.Writer) {
+	if !h.iactive || h.historyWarned {
+		return
+	}
+	if err := h.l.HistoryErr(); err != nil {
+		h.historyWarned = true
+		fmt.Fprintf(w, text.HistoryNotSaved+"\n", err)
+	}
+}
+
+// readDatabase reads the current database from dbmeta, for the prompt. A
+// database that dbmeta cannot ask leaves it unknown, and the prompt shows the
+// database of the URL.
+func (h *Handler) readDatabase(ctx context.Context) {
+	h.database = sql.Null[string]{}
+	if !h.iactive {
+		return
+	}
+	m, err := h.metadata(ctx)
+	if err != nil {
+		return
+	}
+	if d, ok, err := dbmeta.First(dbmeta.CurrentDatabase.All(ctx, m, h.DB(), nil)); err == nil && ok {
+		h.database = sql.Null[string]{V: d.Name.V, Valid: true}
+	}
+}
+
+// Reset empties the query buffer and forgets the last query.
+func (h *Handler) Reset() {
+	h.buf.Reset()
+	h.lastExec, h.lastRaw = "", ""
+}
+
+// Push puts text in front of the input, as \e does with the edited query.
+func (h *Handler) Push(text string) {
+	h.src.Push(text)
+}
+
+// Buffer returns the query buffer.
+func (h *Handler) Buffer() *feed.Buffer {
+	return &h.buf
+}
+
+// Lookup returns the value of a variable, for expanding a statement.
+func (h *Handler) Lookup(name string) (string, bool) {
+	return env.Vars().Get(name)
+}
+
+// RunCommand runs the text of -c, as its own input. A statement left in the
+// buffer at the end of the text is sent.
+func (h *Handler) RunCommand(text string) error {
+	single := h.singleLineMode
+	h.singleLineMode = true
+	defer func() { h.singleLineMode = single }()
+	return h.runText(text)
+}
+
+// maxAliasDepth is the number of aliases that can run one inside the other.
+const maxAliasDepth = 16
+
+// runAlias runs the text of an alias, as its own input. It takes no
+// arguments, and a statement left in the buffer at its end stays there. Each
+// error is written out once, where it happens.
+func (h *Handler) runAlias(stderr io.Writer, body string, it feed.Item) error {
+	var err error
+	switch {
+	case len(it.Args) != 0:
+		err = text.ErrAliasArguments
+	case h.aliasDepth >= maxAliasDepth:
+		err = text.ErrAliasTooDeep
+	}
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return err
+	}
+	h.aliasDepth++
+	defer func() { h.aliasDepth-- }()
+	return h.runText(body)
+}
+
+// runText runs s as its own input, which has \if blocks of its own, as a
+// file has.
+func (h *Handler) runText(s string) error {
+	src, cond := h.src, h.cond
+	defer func() { h.src, h.cond = src, cond }()
+	h.cond = nil
+	var err error
+	if h.src, err = feed.NewSource(feed.NewLines(strings.NewReader(s)), drivers.Language(h.u), nil); err != nil {
+		return err
+	}
+	return h.loop()
 }
 
 // Bind sets the bind parameters for the next query execution.
@@ -549,18 +705,24 @@ func (h *Handler) unbind() []interface{} {
 //	characters must be designated as invisible by surrounding them with %[ and
 //	%]. Multiple pairs of these can occur within the prompt. For example:
 //
-//	testdb=> \set PROMPT1 '%[%033[1;33;40m%]%n@%/%R%[%033[0m%]%# '
+//	testdb=> \uset prompt1 '%[%033[1;33;40m%]%n@%/%R%[%033[0m%]%# '
 //
 //	results in a boldfaced (1;) yellow-on-black (33;40) prompt on
 //	VT100-compatible, color-capable terminals.
 //
-//	%w - Whitespace of the same width as the most recent output of PROMPT1.
-//	This can be used as a PROMPT2 setting, so that multi-line statements are
+//	%w - Whitespace of the same width as the most recent output of prompt1.
+//	This can be used as a prompt2 setting, so that multi-line statements are
 //	aligned with the first line, but there is no visible secondary prompt.
 //
 // To insert a percent sign into your prompt, write %%. The default prompts are
 // '%/%R%x%# ' for prompts 1 and 2, and '>> ' for prompt 3.
 func (h *Handler) Prompt(prompt string) string {
+	return h.render(prompt, false)
+}
+
+// render expands the escapes of prompt. cont is set for the prompt of the rows
+// after the first, where %R is always -.
+func (h *Handler) render(prompt string, cont bool) string {
 	r, connected := []rune(prompt), h.db != nil
 	end := len(r)
 	var buf []byte
@@ -576,7 +738,7 @@ func (h *Handler) Prompt(prompt string) string {
 			if connected {
 				s := dburl.ShortAlias(h.u.Scheme)
 				if s == "" {
-					s = dburl.ShortAlias(h.u.Driver)
+					s = dburl.ShortAlias(h.u.SchemeName)
 				}
 				if s == "" {
 					s = text.UnknownShortAlias
@@ -593,11 +755,11 @@ func (h *Handler) Prompt(prompt string) string {
 			}
 		case 'M': // full host name with domain
 			if connected {
-				buf = append(buf, h.u.Hostname()...)
+				buf = append(buf, h.host().Hostname()...)
 			}
 		case 'm': // host name truncated at first dot, or [local] if it's a domain socket
 			if connected {
-				s := h.u.Hostname()
+				s := h.host().Hostname()
 				if i := strings.Index(s, "."); i != -1 {
 					s = s[:i]
 				}
@@ -605,7 +767,7 @@ func (h *Handler) Prompt(prompt string) string {
 			}
 		case '>': // the port number
 			if connected {
-				s := h.u.Port()
+				s := h.host().Port()
 				if s != "" {
 					s = ":" + s
 				}
@@ -626,6 +788,12 @@ func (h *Handler) Prompt(prompt string) string {
 			switch {
 			case connected && h.u.Opaque != "":
 				buf = append(buf, h.u.Opaque...)
+			case connected && h.database.Valid:
+				// the current database, which follows USE, after the / that
+				// the path of a URL has
+				if h.database.V != "" {
+					buf = append(buf, "/"+h.database.V...)
+				}
 			case connected && h.u.Path != "" && h.u.Path != "/":
 				buf = append(buf, h.u.Path...)
 			}
@@ -668,14 +836,26 @@ func (h *Handler) Prompt(prompt string) string {
 			i--
 		case '~': // like %/ but ~ when default database
 		case '#': // when superuser, a #, otherwise >
-			if h.tx != nil || h.batch {
+			if h.tx != nil {
 				buf = append(buf, '~')
 			} else {
 				buf = append(buf, '>')
 			}
 		// case 'p': // the process id of the connected backend -- never going to be supported
 		case 'R': // statement state
-			buf = append(buf, h.buf.State()...)
+			// = for a new statement, @ for a new statement in a branch of
+			// \if that does not run, and - while the buffer holds a
+			// statement or the entry continues on another row. The line
+			// editor draws one prompt for the rows after the first, so the
+			// state inside a string or a comment is not shown.
+			switch {
+			case cont || !h.buf.Empty():
+				buf = append(buf, '-')
+			case !h.cond.active():
+				buf = append(buf, '@')
+			default:
+				buf = append(buf, '=')
+			}
 		case 'x': // empty when not in a transaction block, * in transaction block, ! in failed transaction block, or ? when indeterminate
 		case 'l': // line number
 		case ':': // variable value
@@ -688,8 +868,24 @@ func (h *Handler) Prompt(prompt string) string {
 	return string(buf)
 }
 
-// IO returns the io for the handler.
-func (h *Handler) IO() rline.IO {
+// host returns the URL whose host and port the prompt shows. For a forward,
+// it is the URL that the forward resolved, such as pg.prod in
+// k+cnpg://pg.prod/app, because the local port changes on each connection.
+func (h *Handler) host() *dburl.URL {
+	if h.fwd != nil {
+		return h.fwdURL
+	}
+	return h.u
+}
+
+// Interactive reports whether the handler reads entries from the line editor
+// at a terminal.
+func (h *Handler) Interactive() bool {
+	return h.iactive
+}
+
+// IO returns the session of the line editor.
+func (h *Handler) IO() *rline.Prompt {
 	return h.l
 }
 
@@ -703,12 +899,35 @@ func (h *Handler) URL() *dburl.URL {
 	return h.u
 }
 
-// DB returns the sql.DB for the handler.
+// DB returns where the statements of the session run: the transaction when
+// one is open, and otherwise the connection of the session. When the session
+// has no connection, and one cannot be taken, it returns the pool.
 func (h *Handler) DB() drivers.DB {
-	if h.tx != nil {
+	switch {
+	case h.tx != nil:
 		return h.tx
+	case h.db == nil:
+		return nil
+	case h.conn == nil:
+		conn, err := drivers.NewSession(context.Background(), h.db)
+		if err != nil {
+			return h.db
+		}
+		h.conn = conn
 	}
-	return h.db
+	return h.conn
+}
+
+// lost drops the connection of the session when err says that it is gone, so
+// that the next statement takes a new one, and reports whether it did. The
+// state of the old session, such as a SET, is gone with it.
+func (h *Handler) lost(err error) bool {
+	if h.conn == nil || h.tx != nil || !drivers.IsConnLost(err) {
+		return false
+	}
+	_ = h.conn.Close()
+	h.conn = nil
+	return true
 }
 
 // LastExec returns the last executed statement.
@@ -716,38 +935,9 @@ func (h *Handler) LastExec() string {
 	return h.lastExec
 }
 
-// LastPrint returns the last printable statement.
-func (h *Handler) LastPrint() string {
-	return h.lastPrint
-}
-
 // LastRaw returns the last raw (non-interpolated) executed statement.
 func (h *Handler) LastRaw() string {
 	return h.lastRaw
-}
-
-// Buf returns the current query statement buffer.
-func (h *Handler) Buf() *stmt.Stmt {
-	return h.buf
-}
-
-// Highlight highlights using the current environment settings.
-func (h *Handler) Highlight(w io.Writer, buf string) error {
-	// create lexer, formatter, styler
-	l := chroma.Coalesce(drivers.Lexer(h.u))
-	f := formatters.Get(env.Get("SYNTAX_HL_FORMAT"))
-	s := styles.Get(env.Get("SYNTAX_HL_STYLE"))
-	// override background
-	if env.Get("SYNTAX_HL_OVERRIDE_BG") != "false" {
-		s = ustyles.Get(env.Get("SYNTAX_HL_STYLE"))
-	}
-	// tokenize stream
-	it, err := l.Tokenise(nil, buf)
-	if err != nil {
-		return err
-	}
-	// write formatted output
-	return f.Format(w, s, it)
 }
 
 // Open handles opening a specified database URL, passing either a single
@@ -761,7 +951,11 @@ func (h *Handler) Highlight(w io.Writer, buf string) error {
 // domain socket, directory, or regular file, respectively).
 func (h *Handler) Open(ctx context.Context, params ...string) error {
 	if len(params) == 0 || params[0] == "" {
-		return nil
+		// with no argument, \c opens a forward again, as after it was lost
+		if h.fwdDSN == "" {
+			return nil
+		}
+		params = []string{h.fwdDSN}
 	}
 	if h.tx != nil {
 		return text.ErrPreviousTransactionExists
@@ -771,21 +965,40 @@ func (h *Handler) Open(ctx context.Context, params ...string) error {
 			params = v
 		}
 	}
+	var u, fwdURL *dburl.URL
+	var fwd *dbfwd.Forward
 	if len(params) < 2 {
 		dsn := params[0]
 		// parse dsn
-		u, err := dburl.Parse(dsn)
-		if err != nil {
+		var err error
+		if u, err = dburl.Parse(dsn); err != nil {
 			return err
 		}
-		h.u = u
+		// a URL such as k+cnpg://pg.prod/app opens through a forward. The
+		// current connection stays when the forward cannot start.
+		if dbfwd.Handles(u) {
+			if fwd, err = h.forward(ctx, u); err != nil {
+				return err
+			}
+			fwdURL = u
+			if u, err = fwd.URL(ctx); err != nil {
+				_ = fwd.Close()
+				return err
+			}
+		}
 		// force parameters
-		h.forceParams(h.u)
+		h.forceParams(u)
 	} else {
-		h.u = &dburl.URL{
+		u = &dburl.URL{
 			Driver: params[0],
 			DSN:    strings.Join(params[1:], " "),
 		}
+	}
+	// the new connection replaces the current one
+	h.drop()
+	h.u, h.fwd, h.fwdURL, h.fwdDSN = u, fwd, fwdURL, ""
+	if fwd != nil {
+		h.fwdDSN = params[0]
 	}
 	// open connection
 	var err error
@@ -794,22 +1007,32 @@ func (h *Handler) Open(ctx context.Context, params ...string) error {
 		defer h.Close()
 		return err
 	}
-	// set buffer options
-	drivers.ConfigStmt(h.u, h.buf)
+	// read what follows in the grammar of the dialect
+	if err := h.setLanguage(); err != nil {
+		return err
+	}
 	// force error/check connection
 	if err == nil {
 		if err = drivers.Ping(ctx, h.u, h.db); err == nil {
 			if h.l.Interactive() {
-				h.l.SetOutput(h.outputHighlighter)
-				h.l.Completer(completer.NewDefaultCompleter(completer.WithConnStrings(h.connStrings())))
-				h.l.Completer(drivers.NewCompleter(ctx, h.u, h.db, readerOpts(), completer.WithConnStrings(h.connStrings())))
+				c := complete.New(complete.WithCommands(metacmd.Completions()), complete.WithConnStrings(h.connStrings()), complete.WithKeywords(h.keywords))
+				if m, err := h.metadata(ctx); err == nil {
+					c = complete.New(
+						complete.WithCommands(metacmd.Completions()),
+						complete.WithSource(describe.Source(m, h.db)),
+						complete.WithConnStrings(h.connStrings()),
+						complete.WithKeywords(h.keywords),
+					)
+				}
+				h.l.SetCompleter(c)
 			}
-
+			h.readDatabase(ctx)
 			return h.Version(ctx)
 		}
 	}
-	// bail without getting password
-	if h.nopw || !drivers.IsPasswordErr(h.u, err) || len(params) > 1 || !h.l.Interactive() {
+	// bail without getting password. A forward reads its password where the
+	// database runs, so a prompt cannot help.
+	if h.nopw || h.fwd != nil || !drivers.IsPasswordErr(h.u, err) || len(params) > 1 || !h.l.Interactive() {
 		defer h.Close()
 		return err
 	}
@@ -827,56 +1050,26 @@ func (h *Handler) Open(ctx context.Context, params ...string) error {
 }
 
 func (h *Handler) connStrings() []string {
-	entries, err := passfile.Entries(h.user.HomeDir, text.PassfileName)
-	if err != nil {
-		// ignore the error as this is only used for completer
-		// and it'll be reported again when trying to force params before opening a conn
-		entries = nil
-	}
 	available := drivers.Available()
-	names := make([]string, 0, len(available)+len(entries))
+	names := make([]string, 0, len(available))
 	for schema := range available {
-		_, aliases := dburl.SchemeDriverAndAliases(schema)
+		_, aliases := dburl.SchemeNameAndAliases(schema)
 		// TODO should we create all combinations of space, :, :// and +transport ?
 		names = append(names, schema)
 		names = append(names, aliases...)
 	}
-	for _, entry := range entries {
-		if entry.Protocol == "*" {
-			continue
-		}
-		user, host, port, dbname := "", "", "", ""
-		if entry.Username != "*" {
-			user = entry.Username + "@"
-			if entry.Host != "*" {
-				host = entry.Host
-				if entry.Port != "*" {
-					port = ":" + entry.Port
-				}
-				if entry.DBName != "*" {
-					dbname = "/" + entry.DBName
-				}
-			}
-		}
-		names = append(names, entry.Protocol+"://"+user+host+port+dbname)
+	// the schemes that dbfwd opens through a forward
+	if name, aliases := dburl.SchemeNameAndAliases("k8s"); name != "" && dbfwd.Handles(&dburl.URL{SchemeName: name}) {
+		names = append(names, name)
+		names = append(names, aliases...)
 	}
 	return append(names, slices.Sorted(maps.Keys(env.Vars().Conn()))...)
 }
 
 // forceParams forces connection parameters on a database URL, adding any
-// driver specific required parameters, and the username/password when a
-// matching entry exists in the PASS file.
+// driver specific required parameters.
 func (h *Handler) forceParams(u *dburl.URL) {
-	// force driver parameters
 	drivers.ForceParams(u)
-	// see if password entry is present
-	user, err := passfile.Match(u, h.user.HomeDir, text.PassfileName)
-	switch {
-	case err != nil:
-		fmt.Fprintln(h.l.Stderr(), "error:", err)
-	case user != nil:
-		u.User = user
-	}
 	// copy back to u
 	z, _ := dburl.Parse(u.String())
 	*u = *z
@@ -897,10 +1090,15 @@ func (h *Handler) Password(dsn string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if dbfwd.Handles(u) {
+		return "", text.ErrPasswordForward
+	}
 	user := h.user.Username
 	if u.User != nil {
 		user = u.User.Username()
 	}
+	// the output so far goes out before the question
+	h.endPage()
 	pass, err := h.l.Password(text.EnterPassword)
 	if err != nil {
 		return "", err
@@ -909,16 +1107,69 @@ func (h *Handler) Password(dsn string) (string, error) {
 	return u.String(), nil
 }
 
-// Close closes the database connection if it is open.
+// Close closes the database connection if it is open, and stops its forward.
 func (h *Handler) Close() error {
 	if h.tx != nil {
 		return text.ErrPreviousTransactionExists
 	}
+	var drv string
+	if h.u != nil {
+		drv = h.u.SchemeName
+	}
+	err := h.drop()
+	h.u, h.fwdURL, h.fwdDSN = nil, nil, ""
+	return drivers.WrapErr(drv, err)
+}
+
+// drop closes the connection of the session, the pool and the forward, and
+// returns the error of closing the pool.
+func (h *Handler) drop() error {
+	var err error
+	if h.conn != nil {
+		_ = h.conn.Close()
+	}
 	if h.db != nil {
-		err := h.db.Close()
-		drv := h.u.Driver
-		h.db, h.u = nil, nil
-		return drivers.WrapErr(drv, err)
+		err = h.db.Close()
+	}
+	if h.fwd != nil {
+		_ = h.fwd.Close()
+	}
+	h.db, h.conn, h.fwd, h.meta, h.database = nil, nil, nil, nil, sql.Null[string]{}
+	return err
+}
+
+// forward starts the forward for u. At a terminal, kubectl and the other
+// tools that dbfwd runs get the terminal, so that a login can prompt.
+func (h *Handler) forward(ctx context.Context, u *dburl.URL) (*dbfwd.Forward, error) {
+	var opts []dbfwd.Option
+	if h.l.Interactive() {
+		opts = append(opts, dbfwd.WithInteractive(h.l.Release))
+	}
+	return dbfwd.Resolve(ctx, u, opts...)
+}
+
+// Forward returns the URL that the forward of the connection resolved, and
+// the forward. Both are nil when the connection has no forward.
+func (h *Handler) Forward() (*dburl.URL, *dbfwd.Forward) {
+	if h.fwd == nil {
+		return nil, nil
+	}
+	return h.fwdURL, h.fwd
+}
+
+// forwardLost returns why the forward of the connection was lost, and nil
+// while it runs or when there is none.
+func (h *Handler) forwardLost() error {
+	if h.fwd == nil {
+		return nil
+	}
+	select {
+	case <-h.fwd.Done():
+	default:
+		return nil
+	}
+	if err := h.fwd.Err(); err != nil {
+		return fmt.Errorf(text.ForwardLost, err)
 	}
 	return nil
 }
@@ -935,6 +1186,8 @@ func (h *Handler) ReadVar(typ, prompt string) (string, error) {
 	default:
 		return "", text.ErrInvalidType
 	}
+	// the output so far goes out before the question
+	h.endPage()
 	var v string
 	var err error
 	if masked {
@@ -942,11 +1195,18 @@ func (h *Handler) ReadVar(typ, prompt string) (string, error) {
 			prompt = text.EnterPassword
 		}
 		v, err = h.l.Password(prompt)
+	} else if h.iactive {
+		// the answer is not an entry, so it is always finished, and it stays
+		// out of the history
+		h.reading = true
+		v, err = h.l.ReadLine(prompt)
+		h.reading = false
+		if err == nil {
+			h.l.RemoveLastHistory()
+			_ = h.l.SaveHistory()
+		}
 	} else {
-		h.l.Prompt(prompt)
-		var r []rune
-		r, err = h.l.Next()
-		v = string(r)
+		v, err = h.src.ReadLine(prompt)
 	}
 	switch typ {
 	case "int":
@@ -979,6 +1239,8 @@ func (h *Handler) ChangePassword(user string) (string, error) {
 	if !h.l.Interactive() {
 		return "", text.ErrNotInteractive
 	}
+	// the output so far goes out before the question
+	h.endPage()
 	var err error
 	if err = drivers.CanChangePassword(h.u); err != nil {
 		return "", err
@@ -1011,31 +1273,84 @@ func (h *Handler) ChangePassword(user string) (string, error) {
 	return drivers.ChangePassword(h.u, h.DB(), user, newpw, oldpw)
 }
 
-// Version prints the database version information after a successful connection.
+// Version prints the database version information after a successful
+// connection. It prints only when the handler reads from the terminal and the
+// output is a terminal too, as psql prints its banner. So -c, -f, --dump and
+// output to a file or a pipe get no line that is not their output.
 func (h *Handler) Version(ctx context.Context) error {
-	if env.Get("SHOW_HOST_INFORMATION") != "true" || !h.l.Interactive() {
+	if env.Setting("show_host_information") != "true" || !h.iactive || !stdoutIsTerminal() {
 		return nil
 	}
 	if h.db == nil {
 		return text.ErrNotConnected
 	}
-	ver, err := drivers.Version(ctx, h.u, h.DB())
+	var ver string
+	var err error
+	if _, ok := dbmeta.Dialect(h.u.Dialect).Info(); ok && !drivers.OwnVersion(h.u) {
+		var m *dbmeta.Meta
+		if m, err = h.metadata(ctx); err == nil {
+			ver = m.String()
+		}
+	} else {
+		ver, err = drivers.Version(ctx, h.u, h.DB())
+	}
 	switch {
 	case err != nil:
 		ver = fmt.Sprintf("<unknown, error: %v>", err)
 	case ver == "":
 		ver = "<unknown>"
 	}
-	h.Print(text.ConnInfo, h.u.Driver, ver)
+	// the message goes to the terminal and not to the pager, as in psql, so
+	// that a long version does not open the pager
+	if env.Setting("quiet") != "on" {
+		fmt.Fprintln(h.l, fmt.Sprintf(text.ConnInfo, h.u.SchemeName, ver))
+		if h.fwd != nil {
+			fmt.Fprintln(h.l, fmt.Sprintf(text.ForwardInfo, h.fwd))
+		}
+	}
 	return nil
+}
+
+// stdoutIsTerminal reports whether the standard output of the process is a
+// terminal. The line editor writes to it.
+func stdoutIsTerminal() bool {
+	fd := os.Stdout.Fd()
+	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
 }
 
 // Print formats according to a format specifier and writes to handler's standard output.
 func (h *Handler) Print(s string, v ...interface{}) {
-	if env.Get("QUIET") == "on" {
+	if env.Setting("quiet") == "on" {
 		return
 	}
-	fmt.Fprintln(h.l.Stdout(), fmt.Sprintf(s, v...))
+	fmt.Fprintln(h.Stdout(), fmt.Sprintf(s, v...))
+}
+
+// doExecDescribe writes the name and the type of each column of the result of
+// the query, without running it, as psql's \gdesc does.
+func (h *Handler) doExecDescribe(ctx context.Context, w io.Writer, _ metacmd.Option, _, sqlstr string, _ bool, _ []interface{}) error {
+	// DB takes the connection of the session when there is none yet, and a
+	// driver describes the query on that connection
+	db := h.DB()
+	var conn drivers.DB
+	if h.conn != nil {
+		conn = h.conn
+	}
+	cols, err := drivers.Describe(ctx, h.u, db, conn, sqlstr)
+	switch {
+	case errors.Is(err, drivers.ErrDescribeNotSupported):
+		return fmt.Errorf(`\gdesc: %w`, err)
+	case err != nil:
+		return err
+	case len(cols) == 0:
+		fmt.Fprintln(w, text.GdescNoColumns)
+		return nil
+	}
+	values := make([][]any, len(cols))
+	for i, c := range cols {
+		values[i] = []any{c.Name, c.Type}
+	}
+	return describe.Table(w, "", []string{"Column", "Type"}, values)
 }
 
 // doExecWatch repeatedly executes a query against the database.
@@ -1061,7 +1376,13 @@ func (h *Handler) doExecWatch(ctx context.Context, w io.Writer, opt metacmd.Opti
 
 // doExecChart executes a single query against the database, displaying its output as a chart.
 func (h *Handler) doExecChart(ctx context.Context, w io.Writer, opt metacmd.Option, prefix, sqlstr string, qtyp bool, bind []interface{}) error {
-	stdout, _, _ := h.l.Stdout(), h.l.Stderr(), h.l.Interactive()
+	stdout := h.l
+	// Report a missing renderer before anything else. Without one no terminal
+	// and no argument can make \chart work, and reporting the terminal first
+	// would name the wrong cause.
+	if !charts.Available() {
+		return text.ErrChartsNotSupported
+	}
 	typ := env.TermGraphics()
 	if !typ.Available() {
 		return text.ErrGraphicsNotSupported
@@ -1080,6 +1401,7 @@ func (h *Handler) doExecChart(ctx context.Context, w io.Writer, opt metacmd.Opti
 	if err != nil {
 		return err
 	}
+	defer rows.Close()
 	// get cols
 	cols, err := drivers.Columns(h.u, rows)
 	if err != nil {
@@ -1106,16 +1428,15 @@ func (h *Handler) doExecChart(ctx context.Context, w io.Writer, opt metacmd.Opti
 	if err != nil {
 		return err
 	}
-	echarts := echartsgoja.New(echartsgoja.WithWidthHeight(cfg.W, cfg.H))
-	res, err := echarts.RenderOptions(ctx, data)
+	res, err := charts.RenderSVG(ctx, data, cfg.W, cfg.H)
 	if err != nil {
 		return err
 	}
 	if cfg.File != "" {
 		fmt.Println("writing to", cfg.File)
-		return os.WriteFile(cfg.File, []byte(res), 0o644)
+		return os.WriteFile(cfg.File, res, 0o644)
 	}
-	img, err := resvg.Render([]byte(res), resvg.WithBackground(cfg.Background))
+	img, err := charts.Rasterize(res, cfg.Background)
 	if err != nil {
 		return err
 	}
@@ -1130,7 +1451,9 @@ func (h *Handler) doExecChart(ctx context.Context, w io.Writer, opt metacmd.Opti
 			s += " (%v)"
 			v = append(v, d.Round(1*time.Millisecond))
 		}
-		fmt.Fprintln(h.l.Stdout(), fmt.Sprintf(s, v...))
+		// as psql does, the time goes to the terminal after the pager exits
+		h.endPage()
+		fmt.Fprintln(h.l, fmt.Sprintf(s, v...))
 	}
 	return nil
 }
@@ -1155,25 +1478,36 @@ func (h *Handler) doExecSingle(ctx context.Context, w io.Writer, opt metacmd.Opt
 			s += " (%v)"
 			v = append(v, d.Round(1*time.Millisecond))
 		}
-		fmt.Fprintln(h.l.Stdout(), fmt.Sprintf(s, v...))
+		// as psql does, the time goes to the terminal after the pager exits
+		h.endPage()
+		fmt.Fprintln(h.l, fmt.Sprintf(s, v...))
 	}
 	return nil
 }
 
 // doExecSet executes a SQL query, setting all returned columns as variables.
-func (h *Handler) doExecSet(ctx context.Context, w io.Writer, opt metacmd.Option, prefix, sqlstr string, _ bool, bind []interface{}) error {
+func (h *Handler) doExecSet(ctx context.Context, w io.Writer, opt metacmd.Option, prefix, sqlstr string, _ bool, bind []interface{}) (err error) {
+	// ROW_COUNT is the number of rows, or 0 when the query fails, as psql
+	// sets it
+	var i int
+	defer func() {
+		if err != nil {
+			i = 0
+		}
+		_ = env.Vars().Set("ROW_COUNT", strconv.Itoa(i))
+	}()
 	// query
 	rows, err := h.DB().QueryContext(ctx, sqlstr, bind...)
 	if err != nil {
 		return err
 	}
+	defer rows.Close()
 	// get cols
 	cols, err := drivers.Columns(h.u, rows)
 	if err != nil {
 		return err
 	}
 	// process row(s)
-	var i int
 	var row []string
 	clen, tfmt := len(cols), env.Vars().PrintTimeFormat()
 	for rows.Next() {
@@ -1185,7 +1519,13 @@ func (h *Handler) doExecSet(ctx context.Context, w io.Writer, opt metacmd.Option
 		}
 		i++
 	}
-	if i > 1 {
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	switch {
+	case i == 0:
+		return text.ErrNoRowsGset
+	case i > 1:
 		return text.ErrTooManyRows
 	}
 	// set vars
@@ -1207,6 +1547,7 @@ func (h *Handler) doExecExec(ctx context.Context, w io.Writer, _ metacmd.Option,
 	if err != nil {
 		return err
 	}
+	defer rows.Close()
 	// exec resulting rows
 	if err := h.doExecRows(ctx, w, rows); err != nil {
 		return err
@@ -1220,14 +1561,25 @@ func (h *Handler) doExecExec(ctx context.Context, w io.Writer, _ metacmd.Option,
 	return nil
 }
 
-// doQuery executes a doQuery against the database.
-func (h *Handler) doQuery(ctx context.Context, w io.Writer, opt metacmd.Option, typ, sqlstr string, bind []interface{}) error {
+// doQuery executes a query against the database, and writes its result. It
+// sets ROW_COUNT to the number of rows of the last result set, or to 0 when the
+// query fails, as psql does.
+func (h *Handler) doQuery(ctx context.Context, w io.Writer, opt metacmd.Option, typ, sqlstr string, bind []interface{}) (err error) {
 	// run query
-	rows, err := h.DB().QueryContext(ctx, sqlstr, bind...)
+	sqlRows, err := h.DB().QueryContext(ctx, sqlstr, bind...)
 	if err != nil {
+		_ = env.Vars().Set("ROW_COUNT", "0")
 		return err
 	}
+	rows := &countedRows{Rows: sqlRows}
 	defer rows.Close()
+	defer func() {
+		n := rows.n
+		if err != nil {
+			n = 0
+		}
+		_ = env.Vars().Set("ROW_COUNT", strconv.FormatInt(n, 10))
+	}()
 	params := env.Vars().Print()
 	params["time"] = env.Vars().PrintTimeFormat()
 	for k, v := range opt.Params {
@@ -1242,7 +1594,7 @@ func (h *Handler) doQuery(ctx context.Context, w io.Writer, opt metacmd.Option, 
 		}
 		if pipeName != "" {
 			if pipeName[0] == '|' {
-				pipe, cmd, err = env.Pipe(h.l.Stdout(), h.l.Stderr(), pipeName[1:])
+				pipe, cmd, err = env.Pipe(h.l, h.l.Stderr(), pipeName[1:])
 			} else {
 				pipe, err = os.OpenFile(pipeName, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0o644)
 			}
@@ -1251,8 +1603,6 @@ func (h *Handler) doQuery(ctx context.Context, w io.Writer, opt metacmd.Option, 
 			}
 			w = pipe
 		}
-	} else if opt.Exec != metacmd.ExecWatch {
-		params["pager_cmd"] = env.Get("PAGER")
 	}
 	// set up column type config
 	var extra []tblfmt.Option
@@ -1260,7 +1610,10 @@ func (h *Handler) doQuery(ctx context.Context, w io.Writer, opt metacmd.Option, 
 	case f != nil:
 		extra = append(extra, tblfmt.WithColumnTypesFunc(f))
 	case drivers.UseColumnTypes(h.u):
-		extra = append(extra, tblfmt.WithUseColumnTypes(true))
+		// Not tblfmt.WithUseColumnTypes, which scans straight into the type
+		// the driver names and so fails on a NULL in a column the driver
+		// described as not nullable. See drivers.NullSafeColumnType.
+		extra = append(extra, tblfmt.WithColumnTypesFunc(drivers.NullSafeColumnType))
 	}
 	resultSet := tblfmt.ResultSet(rows)
 	// wrap query with crosstab
@@ -1274,18 +1627,37 @@ func (h *Handler) doQuery(ctx context.Context, w io.Writer, opt metacmd.Option, 
 	if drivers.LowerColumnNames(h.u) {
 		params["lower_column_names"] = "true"
 	}
+	// a sqlserver EXEC can return a result set with no columns and nothing
+	// after it, so report it as an exec rather than as an empty result set
+	if h.u.SchemeName == "sqlserver" && strings.HasPrefix(typ, "EXEC") && opt.Exec != metacmd.ExecCrosstab {
+		cols, err := rows.Columns()
+		if err != nil {
+			return err
+		}
+		if len(cols) == 0 && !rows.NextResultSet() {
+			fmt.Fprintln(w, typ)
+			return nil
+		}
+	}
+	// align each column by its type, as the model of the dialect records it
+	extra = append(extra, tblfmt.WithColumnAlign(columnAlign(dbmeta.Dialect(h.u.Dialect))))
+	// show the rows in groups, so that a large result does not have to fit
+	// in memory, as psql's FETCH_COUNT does
+	if n, _ := strconv.Atoi(env.Setting("fetch_count")); n > 0 {
+		extra = append(extra, tblfmt.WithCount(n))
+	}
+	// print a binary value as psql prints a bytea, on every database
+	extra = append(extra, tblfmt.WithBytesFormat(dbmeta.Dialect(h.u.Dialect).FormatBinary))
 	// encode and handle error conditions
-	switch err := tblfmt.EncodeAll(w, resultSet, params, extra...); {
+	if indent := env.JSONIndent(params); indent != "" {
+		extra = append(extra, tblfmt.WithIndent(indent))
+	}
+	switch err = tblfmt.EncodeAll(w, resultSet, params, extra...); {
 	case err != nil && cmd != nil && errors.Is(err, syscall.EPIPE):
-		// broken pipe means pager quit before consuming all data, which might be expected
-		return nil
-	case err != nil && h.u.Driver == "sqlserver" && err == tblfmt.ErrResultSetHasNoColumns && strings.HasPrefix(typ, "EXEC"):
-		// sqlserver EXEC statements sometimes do not have results, fake that
-		// it was executed as a exec and not a query
-		fmt.Fprintln(w, typ)
-	case err != nil:
-		return err
-	case params["format"] == "aligned":
+		// the command of \g |command quit before it read all the output, as
+		// head does
+		err = nil
+	case err == nil && env.BlankLineAfter(params):
 		fmt.Fprintln(w)
 	}
 	if pipe != nil {
@@ -1295,6 +1667,31 @@ func (h *Handler) doQuery(ctx context.Context, w io.Writer, opt metacmd.Option, 
 		}
 	}
 	return err
+}
+
+// countedRows counts the rows that are read from the last result set, for
+// ROW_COUNT. It keeps the ColumnTypes method of sql.Rows, which tblfmt uses.
+type countedRows struct {
+	*sql.Rows
+	n int64
+}
+
+// Next satisfies the tblfmt.ResultSet interface.
+func (r *countedRows) Next() bool {
+	ok := r.Rows.Next()
+	if ok {
+		r.n++
+	}
+	return ok
+}
+
+// NextResultSet satisfies the tblfmt.ResultSet interface.
+func (r *countedRows) NextResultSet() bool {
+	ok := r.Rows.NextResultSet()
+	if ok {
+		r.n = 0
+	}
+	return ok
 }
 
 // doExecRows executes all the columns in the row.
@@ -1317,7 +1714,7 @@ func (h *Handler) doExecRows(ctx context.Context, w io.Writer, rows *sql.Rows) e
 			}
 			// execute
 			for _, sqlstr := range row {
-				if err = h.Execute(ctx, w, res, stmt.FindPrefix(sqlstr, true, true, true), sqlstr, false); err != nil {
+				if err = h.Execute(ctx, w, res, sqlstr); err != nil {
 					return err
 				}
 			}
@@ -1395,7 +1792,7 @@ func (h *Handler) doExec(ctx context.Context, w io.Writer, _ metacmd.Option, typ
 		return err
 	}
 	// print name
-	if env.Get("QUIET") == "off" {
+	if env.Setting("quiet") == "off" {
 		fmt.Fprint(w, typ)
 		// print count
 		if count > 0 {
@@ -1419,10 +1816,18 @@ func (h *Handler) BeginTx(ctx context.Context, txOpts *sql.TxOptions) error {
 	if h.tx != nil {
 		return text.ErrPreviousTransactionExists
 	}
+	// the transaction runs on the connection of the session
+	db, ok := h.DB().(interface {
+		BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+	})
+	if !ok {
+		return text.ErrNotConnected
+	}
 	var err error
-	h.tx, err = h.db.BeginTx(ctx, txOpts)
+	h.tx, err = db.BeginTx(ctx, txOpts)
 	if err != nil {
-		return drivers.WrapErr(h.u.Driver, err)
+		h.lost(err)
+		return drivers.WrapErr(h.u.SchemeName, err)
 	}
 	return nil
 }
@@ -1438,7 +1843,7 @@ func (h *Handler) Commit() error {
 	tx := h.tx
 	h.tx = nil
 	if err := tx.Commit(); err != nil {
-		return drivers.WrapErr(h.u.Driver, err)
+		return drivers.WrapErr(h.u.SchemeName, err)
 	}
 	return nil
 }
@@ -1454,74 +1859,64 @@ func (h *Handler) Rollback() error {
 	tx := h.tx
 	h.tx = nil
 	if err := tx.Rollback(); err != nil {
-		return drivers.WrapErr(h.u.Driver, err)
+		return drivers.WrapErr(h.u.SchemeName, err)
 	}
 	return nil
 }
 
-// If starts an if block.
-func (h *Handler) If(ok bool) error {
-	return nil
+// If starts a conditional block, as \if does. It calls eval for the value of
+// the expression only when the block starts in a branch that runs.
+func (h *Handler) If(eval func() (bool, error)) error {
+	return h.cond.begin(eval)
 }
 
-// ElseIf starts an else if block.
-func (h *Handler) ElseIf(ok bool) error {
-	return nil
+// ElseIf starts the next branch of the conditional block, as \elif does. It
+// calls eval only when no branch of the block ran yet.
+func (h *Handler) ElseIf(eval func() (bool, error)) error {
+	return h.cond.elif(eval)
 }
 
-// Else starts an else block.
-func (h *Handler) Else(bool) error {
-	return nil
+// Else starts the last branch of the conditional block, as \else does.
+func (h *Handler) Else() error {
+	return h.cond.els()
 }
 
-// EndIf closes an if block.
-func (h *Handler) EndIf(bool) error {
-	return nil
+// EndIf ends the conditional block, as \endif does.
+func (h *Handler) EndIf() error {
+	return h.cond.end()
 }
 
-// IncludeReader includes the content of rdr.
+// IncludeReader includes the content of rdr, as \i does. A handler of its
+// own reads rdr, on the same connection, and the connection it ends with is
+// kept, so that a \c in the file applies after it.
+//
+// rdr is decoded from the encoding setting, or from the byte order mark at
+// its start (see feed.Decode).
 func (h *Handler) IncludeReader(rdr io.Reader, path string) error {
-	r := bufio.NewReader(rdr)
-	// setup rline
-	l := &rline.Rline{
-		N: func() ([]rune, error) {
-			buf := new(bytes.Buffer)
-			var b []byte
-			var isPrefix bool
-			var err error
-			for {
-				// read
-				b, isPrefix, err = r.ReadLine()
-				// when not EOF
-				if err != nil && err != io.EOF {
-					return nil, err
-				}
-				// append
-				if _, werr := buf.Write(b); werr != nil {
-					return nil, werr
-				}
-				// end of line
-				if !isPrefix || err != nil {
-					break
-				}
-			}
-			// peek and read possible line ending \n or \r\n
-			if err != io.EOF {
-				if err := peekEnding(buf, r); err != nil {
-					return nil, err
-				}
-			}
-			return []rune(buf.String()), err
-		},
-		Out: h.l.Stdout(),
-		Err: h.l.Stderr(),
-		Pw:  h.l.Password,
+	rdr, err := feed.Decode(rdr, env.Setting("encoding"))
+	if err != nil {
+		return err
 	}
-	p := New(l, h.user, filepath.Dir(path), h.charts, h.nopw)
-	p.db, p.u = h.db, h.u
-	drivers.ConfigStmt(p.u, p.buf)
-	err := p.Run()
-	h.db, h.u = p.db, p.u
+	p, err := New(h.l, feed.NewLines(rdr), h.user, filepath.Dir(path), h.charts, h.nopw)
+	if err != nil {
+		return err
+	}
+	p.db, p.conn, p.tx, p.u, p.meta = h.db, h.conn, h.tx, h.u, h.meta
+	p.fwd, p.fwdURL, p.fwdDSN = h.fwd, h.fwdURL, h.fwdDSN
+	p.restrictKey = h.restrictKey
+	if err := p.src.SetLanguage(drivers.Language(p.u)); err != nil {
+		return err
+	}
+	err = p.Run()
+	if errors.Is(err, feed.ErrInvalidUTF8) {
+		err = fmt.Errorf("%s: %w", path, err)
+	}
+	h.db, h.conn, h.tx, h.u, h.meta = p.db, p.conn, p.tx, p.u, p.meta
+	h.fwd, h.fwdURL, h.fwdDSN = p.fwd, p.fwdURL, p.fwdDSN
+	h.restrictKey = p.restrictKey
+	if lerr := h.setLanguage(); err == nil {
+		err = lerr
+	}
 	return err
 }
 
@@ -1540,20 +1935,106 @@ func (h *Handler) Include(path string, relative bool) error {
 	return h.IncludeReader(f, path)
 }
 
-// MetadataWriter loads the metadata writer for the
-func (h *Handler) MetadataWriter(ctx context.Context) (metadata.Writer, error) {
+// Formatter returns the formatter of the describe commands, such as \d, with
+// the options of the session, such as echo_hidden, applied. It writes to the
+// output of the session, so \o redirects it, as it does in psql.
+func (h *Handler) Formatter(ctx context.Context) (*describe.Formatter, error) {
+	m, err := h.metadata(ctx)
+	if err != nil {
+		return nil, err
+	}
+	opts := append(formatterOpts(), describe.WithHighlight(h.Highlight))
+	return describe.NewFormatter(m, h.DB(), h.GetOutput(), h.u.SchemeName, opts...), nil
+}
+
+// Highlight returns s in the colors of syntax highlighting, as the escape
+// sequences of a terminal, when the input is highlighted and the output goes
+// to the terminal. Otherwise, such as with \o or when the output is not a
+// terminal, it returns s as it is.
+func (h *Handler) Highlight(s string) string {
+	if h.hl == nil || h.out != nil {
+		return s
+	}
+	if width, _ := h.l.Size(); width <= 0 {
+		return s
+	}
+	return h.hl.Text(s)
+}
+
+// metadata returns dbmeta's model of the database. It is read once for each
+// connection.
+func (h *Handler) metadata(ctx context.Context) (*dbmeta.Meta, error) {
 	if h.db == nil {
 		return nil, text.ErrNotConnected
 	}
-	return drivers.NewMetadataWriter(ctx, h.u, h.db, h.l.Stdout(), readerOpts()...)
+	if h.meta == nil {
+		m, err := drivers.Meta(ctx, h.u, h.DB())
+		if err != nil {
+			return nil, err
+		}
+		h.meta = m
+	}
+	return h.meta, nil
 }
 
 // GetOutput gets the output writer.
 func (h *Handler) GetOutput() io.Writer {
 	if h.out == nil {
-		return h.l.Stdout()
+		return h.Stdout()
 	}
 	return h.out
+}
+
+// Stdout returns where the entry that runs now writes its output. When the
+// output is taller or wider than the terminal, it goes to the pager, as \pset
+// pager and \pset pager_min_lines say.
+func (h *Handler) Stdout() io.Writer {
+	if h.page == nil {
+		h.page = pager.New(h.l, h.pagerConfig())
+	}
+	return h.page
+}
+
+// endPage writes the output of the entry that ran to the terminal, or waits for
+// its pager to exit.
+func (h *Handler) endPage() {
+	if h.page == nil {
+		return
+	}
+	page := h.page
+	h.page = nil
+	if err := page.Close(); err != nil {
+		fmt.Fprintln(h.l.Stderr(), "error:", err)
+	}
+}
+
+// pagerConfig returns the configuration of the pager from the settings. The
+// pager runs only when the line editor writes to a terminal, which has a size.
+func (h *Handler) pagerConfig() pager.Config {
+	params := env.Vars().Print()
+	mode, command := params["pager"], env.Setting("pager")
+	width, height := h.l.Size()
+	if mode == "off" || command == "" || width <= 0 || height <= 0 {
+		return pager.Config{}
+	}
+	if c, _ := strconv.Atoi(params["columns"]); c > 0 {
+		width = c
+	}
+	minLines, _ := strconv.Atoi(params["pager_min_lines"])
+	shell, param := env.Getshell()
+	if shell == "" {
+		return pager.Config{}
+	}
+	return pager.Config{
+		Command:  command,
+		Shell:    []string{shell, param},
+		Env:      env.Vars().Environ(),
+		Always:   mode == "always",
+		Width:    width,
+		Height:   height,
+		MinLines: minLines,
+		Terminal: h.l.Release,
+	}
 }
 
 // SetOutput sets the output writer.
@@ -1595,52 +2076,21 @@ func (e *Error) Unwrap() error {
 	return e.Err
 }
 
-func readerOpts() []metadata.ReaderOption {
-	var opts []metadata.ReaderOption
-	if env.Get("ECHO_HIDDEN") == "on" || env.Get("ECHO_HIDDEN") == "noexec" {
-		if env.Get("ECHO_HIDDEN") == "noexec" {
-			opts = append(opts, metadata.WithDryRun(true))
+// formatterOpts returns the options of the describe commands that
+// echo_hidden sets.
+func formatterOpts() []describe.Option {
+	var opts []describe.Option
+	if env.Setting("echo_hidden") == "on" || env.Setting("echo_hidden") == "noexec" {
+		if env.Setting("echo_hidden") == "noexec" {
+			opts = append(opts, describe.WithDryRun(true))
 		}
 		opts = append(
 			opts,
-			metadata.WithLogger(log.New(os.Stdout, "DEBUG: ", log.LstdFlags)),
-			metadata.WithTimeout(30*time.Second),
+			describe.WithLogger(log.New(os.Stdout, "DEBUG: ", log.LstdFlags)),
+			describe.WithTimeout(30*time.Second),
 		)
 	}
 	return opts
-}
-
-// peekEnding peeks to see if the next successive bytes in r is \n or \r\n,
-// writing to w if it is. Does not advance r if the next bytes are not \n or
-// \r\n.
-func peekEnding(w io.Writer, r *bufio.Reader) error {
-	// peek first byte
-	buf, err := r.Peek(1)
-	switch {
-	case err != nil && err != io.EOF:
-		return err
-	case err == nil && buf[0] == '\n':
-		if _, rerr := r.ReadByte(); err != nil && err != io.EOF {
-			return rerr
-		}
-		_, werr := w.Write([]byte{'\n'})
-		return werr
-	case err == nil && buf[0] != '\r':
-		return nil
-	}
-	// peek second byte
-	buf, err = r.Peek(1)
-	switch {
-	case err != nil && err != io.EOF:
-		return err
-	case err == nil && buf[0] != '\n':
-		return nil
-	}
-	if _, rerr := r.ReadByte(); err != nil && err != io.EOF {
-		return rerr
-	}
-	_, werr := w.Write([]byte{'\n'})
-	return werr
 }
 
 // grab returns the i'th rune from r when i < end, otherwise 0.
@@ -1651,45 +2101,29 @@ func grab(r []rune, i, end int) rune {
 	return 0
 }
 
-// empty reports whether s contains at least one printable, non-space
-// character.
-func empty(s string) bool {
-	return strings.IndexFunc(s, func(r rune) bool {
-		return unicode.IsPrint(r) && !unicode.IsSpace(r)
-	}) == -1
-}
-
-// lastcolor returns the last defined color in s, if any.
-func lastcolor(s string) string {
-	if i := strings.LastIndex(s, "\n"); i != -1 {
-		s = s[:i]
+// keywords returns the keywords that the grammar of the database accepts
+// after stmt, for the completer. Before a connection, the grammar is the one
+// of PostgreSQL, as in psql.
+func (h *Handler) keywords(stmt string) []string {
+	var dialect string
+	if h.u != nil {
+		dialect = h.u.Dialect
 	}
-	if i := strings.LastIndex(s, "\x1b[0m"); i != -1 {
-		s = s[i+4:]
-	}
-	return strings.Join(ansiRE.FindAllString(s, -1), "")
+	words, _ := highlight.Keywords(context.Background(), dialect, []byte(stmt))
+	return words
 }
 
-// isSpaceOrControl returns true when r is a space or control character.
-func isSpaceOrControl(r rune) bool {
-	return unicode.IsSpace(r) || unicode.IsControl(r)
-}
-
-// lastIndex returns the last index in r of needle, or -1 if not found.
-func lastIndex(r []rune, needle rune) int {
-	for i := len(r) - 1; i >= 0; i-- {
-		if r[i] == needle {
-			return i
+// columnAlign returns the alignment of a column of d, from its type. It
+// returns false when the model of d records no alignment for the type, and the
+// encoder then aligns the column by its values.
+func columnAlign(d dbmeta.Dialect) func(*sql.ColumnType) (tblfmt.Align, bool) {
+	return func(col *sql.ColumnType) (tblfmt.Align, bool) {
+		switch align, ok := d.ColumnAlign(col); {
+		case !ok:
+			return 0, false
+		case align == dbmeta.AlignRight:
+			return tblfmt.AlignRight, true
 		}
+		return tblfmt.AlignLeft, true
 	}
-	return -1
 }
-
-// ansiRE matches ansi escape (color) codes.
-var ansiRE = regexp.MustCompile(`\x1b[[0-9]+([:;][0-9]+)*m`)
-
-// lineendRE is the end of line terminal.
-var lineendRE = regexp.MustCompile(`(?:\r?\n)+$`)
-
-// helpQuitExitRE is a regexp to use to match help, quit, or exit messages.
-var helpQuitExitRE = regexp.MustCompile(`(?im)^+(` + strings.Join([]string{text.HelpPrefix, text.QuitPrefix, text.ExitPrefix}, "|") + `)\s*$`)

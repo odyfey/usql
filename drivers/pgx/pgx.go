@@ -1,14 +1,22 @@
 // Package pgx defines and registers usql's PostgreSQL PGX driver.
 //
+// dburl opens pgx:// and postgres:// URLs with it, so it registers under both
+// schemes. When the build has no pgx, internal gives the postgres scheme to
+// the libpq driver. The redshift, cockroachdb, cratedb and questdb drivers
+// register the same driver under their own names, through pgwire.
+//
 // See: https://github.com/jackc/pgx
+// Tags: postgres
 package pgx
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -16,16 +24,20 @@ import (
 	"github.com/jackc/pgx/v5/stdlib" // DRIVER
 	"github.com/xo/dburl"
 	"github.com/xo/usql/drivers"
-	"github.com/xo/usql/drivers/metadata"
-	pgmeta "github.com/xo/usql/drivers/metadata/postgres"
+	"github.com/xo/usql/drivers/pgwire/pgshared"
 	"github.com/xo/usql/text"
 )
 
 func init() {
-	drivers.Register("pgx", drivers.Driver{
-		AllowDollar:            true,
-		AllowMultilineComments: true,
-		LexerName:              "postgres",
+	drivers.Register("pgx", Driver())
+	drivers.Register("postgres", Driver())
+}
+
+// Driver returns the pgx driver. dburl opens a database that speaks the
+// PostgreSQL protocol, such as CockroachDB, through pgx, which it names in
+// URL.Driver, and usql registers this driver under that database's own name.
+func Driver() drivers.Driver {
+	return drivers.Driver{
 		Open: func(ctx context.Context, u *dburl.URL, stdout, stderr func() io.Writer) (func(string, string) (*sql.DB, error), error) {
 			return func(_, dsn string) (*sql.DB, error) {
 				config, err := pgx.ParseConfig(dsn)
@@ -53,18 +65,8 @@ func init() {
 				return stdlib.OpenDB(*config), nil
 			}, nil
 		},
-		Version: func(ctx context.Context, db drivers.DB) (string, error) {
-			var ver string
-			err := db.QueryRowContext(ctx, `SHOW server_version`).Scan(&ver)
-			if err != nil {
-				return "", err
-			}
-			return "PostgreSQL " + ver, nil
-		},
-		ChangePassword: func(db drivers.DB, user, newpw, _ string) error {
-			_, err := db.Exec(`ALTER USER ` + user + ` PASSWORD '` + newpw + `'`)
-			return err
-		},
+		ColumnTypes: pgshared.Dest,
+		ConnInfo:    connInfo,
 		Err: func(err error) (string, string) {
 			var e *pgconn.PgError
 			if errors.As(err, &e) {
@@ -72,82 +74,105 @@ func init() {
 			}
 			return "", err.Error()
 		},
+		// pgx prepares the statement unnamed, which describes its result
+		// without running it, as psql's \gdesc does with PQdescribePrepared
+		Describe: func(ctx context.Context, conn drivers.DB, query string) ([]drivers.ResultType, error) {
+			var types []drivers.ResultType
+			ok, err := drivers.Raw(ctx, conn, func(dc any) error {
+				c, ok := dc.(*stdlib.Conn)
+				if !ok {
+					return drivers.ErrDescribeNotSupported
+				}
+				sd, err := c.Conn().Prepare(ctx, "", query)
+				if err != nil {
+					return err
+				}
+				for _, f := range sd.Fields {
+					types = append(types, drivers.ResultType{Name: f.Name, OID: f.DataTypeOID, Modifier: f.TypeModifier})
+				}
+				return nil
+			})
+			if !ok {
+				return nil, drivers.ErrDescribeNotSupported
+			}
+			return types, err
+		},
+		ErrVerbose: func(err error, query string) string {
+			var e *pgconn.PgError
+			if !errors.As(err, &e) {
+				return ""
+			}
+			return pgshared.Verbose(pgshared.ErrorFields{
+				Severity:         e.Severity,
+				Code:             e.Code,
+				Message:          e.Message,
+				Detail:           e.Detail,
+				Hint:             e.Hint,
+				Position:         int(e.Position),
+				InternalPosition: int(e.InternalPosition),
+				InternalQuery:    e.InternalQuery,
+				Where:            e.Where,
+				SchemaName:       e.SchemaName,
+				TableName:        e.TableName,
+				ColumnName:       e.ColumnName,
+				DataTypeName:     e.DataTypeName,
+				ConstraintName:   e.ConstraintName,
+				File:             e.File,
+				Line:             int(e.Line),
+				Routine:          e.Routine,
+			}, query)
+		},
+		// class 28 is a refused authorization: PostgreSQL says 28P01, and Redshift
+		// says 28000
 		IsPasswordErr: func(err error) bool {
 			var e *pgconn.PgError
-			if errors.As(err, &e) {
-				return e.Code == "28P01"
-			}
-			return false
+			return errors.As(err, &e) && strings.HasPrefix(e.Code, "28")
 		},
-		NewMetadataReader: pgmeta.NewReader(),
-		NewMetadataWriter: func(db drivers.DB, w io.Writer, opts ...metadata.ReaderOption) metadata.Writer {
-			return metadata.NewDefaultWriter(pgmeta.NewReader()(db, opts...))(db, w)
-		},
+		// pgx copies through CopyFrom, on the connection that it holds
 		Copy: func(ctx context.Context, db *sql.DB, rows *sql.Rows, table string) (int64, error) {
-			conn, err := db.Conn(context.Background())
+			schema, name, columns, err := drivers.CopyTarget(ctx, db, table)
+			if err != nil {
+				return 0, err
+			}
+			ident := pgx.Identifier{name}
+			if schema != "" {
+				ident = pgx.Identifier{schema, name}
+			}
+			conn, err := db.Conn(ctx)
 			if err != nil {
 				return 0, fmt.Errorf("failed to get a connection from pool: %w", err)
 			}
-
-			leftParen := strings.IndexRune(table, '(')
-			colQuery := "SELECT * FROM " + table + " WHERE 1=0"
-			if leftParen != -1 {
-				// pgx's CopyFrom needs a slice of column names and splitting them by a comma is unreliable
-				// so evaluate the possible expressions against the target table
-				colQuery = "SELECT " + table[leftParen+1:len(table)-1] + " FROM " + table[:leftParen] + " WHERE 1=0"
-				table = table[:leftParen]
-			}
-			colStmt, err := db.PrepareContext(ctx, colQuery)
-			if err != nil {
-				return 0, fmt.Errorf("failed to prepare query to determine target table columns: %w", err)
-			}
-			colRows, err := colStmt.QueryContext(ctx)
-			if err != nil {
-				return 0, fmt.Errorf("failed to execute query to determine target table columns: %w", err)
-			}
-			columns, err := colRows.Columns()
-			if err != nil {
-				return 0, fmt.Errorf("failed to fetch target table columns: %w", err)
-			}
-			clen := len(columns)
-
-			crows := &copyRows{
-				rows:   rows,
-				values: make([]interface{}, clen),
-			}
-			for i := 0; i < clen; i++ {
-				crows.values[i] = new(interface{})
-			}
-
+			defer conn.Close()
 			var n int64
-			err = conn.Raw(func(driverConn interface{}) error {
-				conn := driverConn.(*stdlib.Conn).Conn()
-				n, err = conn.CopyFrom(ctx, pgx.Identifier(strings.SplitN(table, ".", 2)), columns, crows)
+			err = conn.Raw(func(driverConn any) error {
+				var err error
+				n, err = driverConn.(*stdlib.Conn).Conn().CopyFrom(ctx, ident, columns, drivers.NewCopyRows(rows, len(columns)))
 				return err
 			})
 			return n, err
 		},
-	})
-}
-
-type copyRows struct {
-	rows   *sql.Rows
-	values []interface{}
-}
-
-func (r *copyRows) Next() bool {
-	return r.rows.Next()
-}
-
-func (r *copyRows) Values() ([]interface{}, error) {
-	err := r.rows.Scan(r.values...)
-	actuals := make([]interface{}, len(r.values))
-	for i, v := range r.values {
-		actuals[i] = *(v.(*interface{}))
 	}
-	return actuals, err
 }
 
-func (r *copyRows) Err() error {
-	return r.rows.Err()
+// connInfo returns what psql's \conninfo shows about a connection of pgx: the
+// connection of the session, or one connection of a pool. It reads nothing
+// inside a transaction.
+func connInfo(ctx context.Context, db drivers.DB) ([][2]string, error) {
+	var info [][2]string
+	_, err := drivers.Raw(ctx, db, func(dc any) error {
+		c, ok := dc.(*stdlib.Conn)
+		if !ok {
+			return nil
+		}
+		pc := c.Conn().PgConn()
+		_, ssl := pc.Conn().(*tls.Conn)
+		info = [][2]string{
+			{"Backend PID", strconv.FormatUint(uint64(pc.PID()), 10)},
+			{"SSL Connection", strconv.FormatBool(ssl)},
+			{"Superuser", pc.ParameterStatus("is_superuser")},
+			{"Hot Standby", pc.ParameterStatus("in_hot_standby")},
+		}
+		return nil
+	})
+	return info, err
 }

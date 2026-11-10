@@ -1,0 +1,243 @@
+package main
+
+import (
+	"go/build"
+	"go/parser"
+	"go/token"
+	"maps"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime/debug"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/xo/dburl"
+	"github.com/xo/usql/drivers"
+	"github.com/xo/usql/internal"
+)
+
+// seeRE matches the See: line in a driver's package comment.
+var seeRE = regexp.MustCompile(`(?m)^See:\s+(.*)$`)
+
+// TestDriverSeeMatchesDburl checks that every driver's See: line is the same
+// URL that dburl records for the scheme.
+//
+// gen.go stopped reading See: when the driver metadata moved to dburl, so
+// nothing else compares the two. Without this the lines rot silently: the
+// Hive driver's See: was corrected by hand when the driver was replaced, and
+// nothing would have caught it if it had not been.
+func TestDriverSeeMatchesDburl(t *testing.T) {
+	t.Parallel()
+	schemes := schemeIndex()
+	var checked int
+	for _, tag := range driverTags(t) {
+		scheme, ok := schemes[tag]
+		if !ok {
+			t.Errorf("driver %s has no dburl scheme.\n"+
+				"Every driver needs one, because gen.go reads the driver's\n"+
+				"package, description and URL from it.", tag)
+			continue
+		}
+		see, ok := driverSee(t, tag)
+		if !ok {
+			t.Errorf("driver %s has no See: line in its package comment.\n"+
+				"It should read: See: %s", tag, scheme.DriverURL)
+			continue
+		}
+		checked++
+		if see != scheme.DriverURL {
+			t.Errorf("driver %s says See: %s and dburl says %s.\n"+
+				"dburl owns this URL. Change it there and copy it here, or\n"+
+				"delete the See: line.", tag, see, scheme.DriverURL)
+		}
+	}
+	// A test that checks nothing passes. Guard the count as well as the
+	// values, so that a walk which stops finding drivers fails. The drivers in
+	// plainDrivers of gen.go have no package, and so no See: line.
+	if checked < 15 {
+		t.Errorf("compared %d See: lines against dburl, expected at least 15.\n"+
+			"The driver walk is probably not finding them any more.", checked)
+	}
+}
+
+// schemeIndex indexes dburl's schemes by driver name and by alias, so that a
+// build tag resolves even when it differs from the scheme.
+func schemeIndex() map[string]dburl.Scheme {
+	m := make(map[string]dburl.Scheme)
+	for _, scheme := range dburl.BaseSchemes() {
+		m[scheme.Name] = scheme
+		for _, alias := range scheme.Aliases {
+			if _, ok := m[alias]; !ok {
+				m[alias] = scheme
+			}
+		}
+	}
+	return m
+}
+
+// driverTags returns the build tag of every driver that has a package, which
+// is the name of its directory under drivers/.
+func driverTags(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir("drivers")
+	if err != nil {
+		t.Fatalf("reading drivers: %v", err)
+	}
+	// These hold a file named after the directory but are support packages
+	// rather than drivers. gen.go skips the same two.
+	skip := map[string]bool{"completer": true, "metadata": true}
+	var tags []string
+	for _, entry := range entries {
+		if !entry.IsDir() || skip[entry.Name()] {
+			continue
+		}
+		tag := entry.Name()
+		// A driver is a directory holding a file of the same name.
+		if _, err := os.Stat(filepath.Join("drivers", tag, tag+".go")); err != nil {
+			continue
+		}
+		tags = append(tags, tag)
+	}
+	return tags
+}
+
+// driverSee returns the URL on a driver's See: line.
+func driverSee(t *testing.T, tag string) (string, bool) {
+	t.Helper()
+	name := filepath.Join("drivers", tag, tag+".go")
+	f, err := parser.ParseFile(token.NewFileSet(), name, nil, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", name, err)
+	}
+	m := seeRE.FindStringSubmatch(f.Doc.Text())
+	if m == nil {
+		return "", false
+	}
+	return strings.TrimSpace(m[1]), true
+}
+
+// TestRegistryIsKeyedByScheme checks that usql's driver registry is keyed by
+// dburl's scheme name, which is URL.SchemeName, and not by the name that
+// database/sql opens, which is URL.Driver.
+//
+// The two names differ for tidb://, whose Driver is mysql, and for
+// postgres://, whose Driver is pgx. A registry entry under the wrong one
+// compiles and registers, and the URL then gets another database's hooks, or
+// none. This test is the only thing that notices.
+func TestRegistryIsKeyedByScheme(t *testing.T) {
+	t.Parallel()
+	names := make(map[string]bool)
+	for _, scheme := range dburl.BaseSchemes() {
+		names[scheme.Name] = true
+	}
+	registered := drivers.Available()
+	for _, name := range slices.Sorted(maps.Keys(registered)) {
+		if !names[name] {
+			t.Errorf("driver %s is registered under a name that is not a dburl scheme."+
+				" Register it under its scheme's Name, which is what URL.SchemeName holds.", name)
+		}
+	}
+	// gen.go writes the scheme Name of each driver into KnownBuildTags.
+	// A registered name that no package documents is one registered under
+	// the wrong name, and registering one name twice already panics.
+	documented := make(map[string]string)
+	for tag, name := range internal.KnownBuildTags() {
+		if !names[name] {
+			t.Errorf("KnownBuildTags maps %s to %s, which is not a dburl scheme", tag, name)
+		}
+		documented[name] = tag
+	}
+	for _, name := range slices.Sorted(maps.Keys(registered)) {
+		if _, ok := documented[name]; !ok {
+			t.Errorf("driver %s is registered, and no driver package documents"+
+				" the scheme %s", name, name)
+		}
+	}
+	// each driver that this build links must be registered, which also keeps
+	// the checks above from passing on an empty registry
+	linked := linkedDrivers(t)
+	for _, name := range linked {
+		if _, ok := registered[name]; !ok {
+			t.Errorf("driver %s is linked into this build and is not registered", name)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(registered)) {
+		if !slices.Contains(linked, name) {
+			t.Logf("driver %s is registered with no file of its own in internal", name)
+		}
+	}
+}
+
+// linkedDrivers returns the scheme name of each driver that this build links.
+// gen.go writes a file to internal for each driver, whose build constraint
+// decides whether the build imports the driver. The build tags of the test
+// binary are read from its build information, so the result is right for any
+// set of tags.
+func linkedDrivers(t *testing.T) []string {
+	t.Helper()
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		t.Fatal("the test binary has no build information")
+	}
+	ctx := build.Default
+	ctx.BuildTags = nil
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "-tags":
+			ctx.BuildTags = strings.Split(s.Value, ",")
+		case "CGO_ENABLED":
+			ctx.CgoEnabled = s.Value == "1"
+		case "GOOS":
+			ctx.GOOS = s.Value
+		case "GOARCH":
+			ctx.GOARCH = s.Value
+		}
+	}
+	tags := internal.KnownBuildTags()
+	files, err := filepath.Glob(filepath.Join("internal", "*.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, file := range files {
+		file = filepath.Base(file)
+		name, ok := tags[strings.TrimSuffix(file, ".go")]
+		if !ok {
+			// not a driver, such as internal.go or a feature like charts
+			continue
+		}
+		match, err := ctx.MatchFile("internal", file)
+		if err != nil {
+			t.Fatalf("matching internal/%s: %v", file, err)
+		}
+		if match {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+// TestPgwireConstraints checks that pgwire picks pgx exactly when the build has
+// the pgx driver. pgx.go must carry the constraint that gen.go writes for pgx,
+// and libpq.go its negation.
+func TestPgwireConstraints(t *testing.T) {
+	t.Parallel()
+	first := func(name string) string {
+		buf, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+		line, _, _ := strings.Cut(string(buf), "\n")
+		return strings.TrimPrefix(line, "//go:build ")
+	}
+	want := first(filepath.Join("internal", "pgx.go"))
+	if got := first(filepath.Join("drivers", "pgwire", "pgx.go")); got != want {
+		t.Errorf("drivers/pgwire/pgx.go: expected %q, got: %q", want, got)
+	}
+	if got, want := first(filepath.Join("drivers", "pgwire", "libpq.go")), "!("+want+")"; got != want {
+		t.Errorf("drivers/pgwire/libpq.go: expected %q, got: %q", want, got)
+	}
+}

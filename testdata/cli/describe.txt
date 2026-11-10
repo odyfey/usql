@@ -1,0 +1,103 @@
+# usql capture transcript v1
+session: describe
+about: \d lists relations and \d name describes one
+term: xterm-256color
+size: 80x24
+
+## step 0
+send:
+
+recv:
+\e[mConnected with driver sqlite3 (VERSION)\r
+\n
+\e[0cType "help" for help.\r
+\n
+\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 1
+send:
+create table films (id int primary key, title text);\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mcreate\e[39m \e[38;5;81mtable\e[39m \e[38;5;81mfilms\e[39m \e[38;5;231m(id\e[39m \e[38;5;81mint\e[39m \e[38;5;81mprimary\e[39m \e[38;5;81mkey\e[38;5;231m,\e[39m \e[38;5;231mtitle\e[39m \e[38;5;81mtext\e[38;5;231m);\e[39m\e[K\r
+\e[66C\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mcreate\e[39m \e[38;5;81mtable\e[39m \e[38;5;81mfilms\e[39m \e[38;5;231m(id\e[39m \e[38;5;81mint\e[39m \e[38;5;81mprimary\e[39m \e[38;5;81mkey\e[38;5;231m,\e[39m \e[38;5;231mtitle\e[39m \e[38;5;81mtext\e[38;5;231m);\e[39m\e[K\r
+\e[66C\e[?2004l\r
+\n
+CREATE TABLE\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 2
+send:
+\\dt\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\dt\e[39m\e[K\r
+\e[17C\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\dt\e[39m\e[K\r
+\e[17C\e[?2004l\r
+\n
+     List of tables\r
+\n
+ Schema | Name  | Type  \r
+\n
+--------+-------+-------\r
+\n
+ main   | films | table\r
+\n
+(1 row)\r
+\n
+\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 3
+send:
+\\d films\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\d\e[39m \e[38;5;231mfilms\e[39m\e[K\r
+\e[22C\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\d\e[39m \e[38;5;231mfilms\e[39m\e[K\r
+\e[22C\e[?2004l\r
+\n
+         Table "main.films"\r
+\n
+ Column | Type | Nullable | Default \r
+\n
+--------+------+----------+---------\r
+\n
+ id     | INT  |          | \r
+\n
+ title  | TEXT |          | \r
+\n
+Indexes:\r
+\n
+    "sqlite_autoindex_films_1" PRIMARY KEY, btree\r
+\n
+\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 4
+send:
+\\q\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\q\e[39m\e[K\r
+\e[16C\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\q\e[39m\e[K\r
+\e[16C\e[?2004l\r
+\n
+

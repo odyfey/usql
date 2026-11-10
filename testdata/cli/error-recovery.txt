@@ -1,0 +1,71 @@
+# usql capture transcript v1
+session: error-recovery
+about: a failed statement reports an error and the prompt returns
+term: xterm-256color
+size: 80x24
+
+## step 0
+send:
+
+recv:
+\e[mConnected with driver sqlite3 (VERSION)\r
+\n
+\e[0cType "help" for help.\r
+\n
+\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 1
+send:
+select * from nonexistent;\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mselect\e[39m \e[38;5;186m*\e[39m \e[38;5;81mfrom\e[39m \e[38;5;81mnonexistent\e[38;5;231m;\e[39m\e[K\r
+\e[40C\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mselect\e[39m \e[38;5;186m*\e[39m \e[38;5;81mfrom\e[39m \e[38;5;81mnonexistent\e[38;5;231m;\e[39m\e[K\r
+\e[40C\e[?2004l\r
+\n
+error: sqlite3: 1: no such table: nonexistent\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 2
+send:
+select 1 as still_works;\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mselect\e[39m \e[38;5;141m1\e[39m \e[38;5;81mas\e[39m \e[38;5;231mstill_works;\e[39m\e[K\r
+\e[38C\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mselect\e[39m \e[38;5;141m1\e[39m \e[38;5;81mas\e[39m \e[38;5;231mstill_works;\e[39m\e[K\r
+\e[38C\e[?2004l\r
+\n
+ still_works \r
+\n
+-------------\r
+\n
+           1\r
+\n
+(1 row)\r
+\n
+\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 3
+send:
+\\q\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\q\e[39m\e[K\r
+\e[16C\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\q\e[39m\e[K\r
+\e[16C\e[?2004l\r
+\n
+

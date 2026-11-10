@@ -1,0 +1,1449 @@
+package describe
+
+import (
+	"cmp"
+	"context"
+	"database/sql"
+	"fmt"
+	"io"
+	"slices"
+	"strconv"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/xo/dbmeta"
+	"github.com/xo/usql/text"
+)
+
+// Call is one describe command as typed, such as \dT+ public.*.
+type Call struct {
+	// Name is the name of the command without S and +, such as dT.
+	Name string
+	// Patterns are the patterns that follow the name.
+	Patterns []string
+	// Verbose is set by +.
+	Verbose bool
+	// System is set by S, and lists the objects of the system too.
+	System bool
+	// Flags are the letters that follow the name, such as the t of \dPt.
+	Flags string
+}
+
+// typePatterns returns psql's type patterns, such as int* or
+// pg_catalog.int4, as dbmeta's Args.ArgTypes takes them: folded as the
+// product folds a name, with * and ? as LIKE's % and _, and - kept for no
+// argument. It returns nil for no patterns.
+func (f *Formatter) typePatterns(patterns []string) []string {
+	if len(patterns) == 0 {
+		return nil
+	}
+	types := make([]string, len(patterns))
+	for i, p := range patterns {
+		if p == "-" {
+			types[i] = p
+			continue
+		}
+		schema, name := f.meta.Dialect().Pattern(p)
+		if schema != "" {
+			name = schema + "." + name
+		}
+		types[i] = name
+	}
+	return types
+}
+
+// pattern returns the i'th pattern, or an empty string.
+func (c Call) pattern(i int) string {
+	if i < len(c.Patterns) {
+		return c.Patterns[i]
+	}
+	return ""
+}
+
+// command runs one describe command.
+type command func(context.Context, *Formatter, Call) error
+
+// commands are the describe commands that print one list, keyed by name.
+// Commands that print more than a list, such as \d NAME, are methods of
+// Writer.
+var commands = map[string]command{
+	"dA":      accessMethods,
+	"dAc":     byAccessMethod(operatorClasses),
+	"dAf":     byAccessMethod(operatorFamilies),
+	"dAo":     byAccessMethod(familyOperators),
+	"dAp":     byAccessMethod(familyFunctions),
+	"db":      tablespaces,
+	"dc":      conversions,
+	"dconfig": settings,
+	"dC":      casts,
+	"dd":      comments,
+	"dD":      domains,
+	"ddp":     defaultACLs,
+	"des":     foreignServers,
+	"det":     foreignTables,
+	"deu":     userMappings,
+	"dew":     foreignDataWrappers,
+	"dF":      textSearchConfigs,
+	"dFd":     textSearchDictionaries,
+	"dFp":     textSearchParsers,
+	"dFt":     textSearchTemplates,
+	"dg":      roles,
+	"dl":      largeObjects,
+	"dL":      languages,
+	"do":      operators,
+	"dO":      collations,
+	"dP":      partitionedTables,
+	"drds":    roleSettings,
+	"drg":     roleGrants,
+	"dRp":     publications,
+	"dRs":     subscriptions,
+	"dT":      types,
+	"du":      roles,
+	"dx":      extensions,
+	"dX":      extendedStats,
+	"dy":      eventTriggers,
+}
+
+// Commands returns the names of the describe commands that Run answers.
+func Commands() []string {
+	names := make([]string, 0, len(commands))
+	for name := range commands {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// Run runs the describe command c. It returns false when no such command
+// exists.
+func (f *Formatter) Run(ctx context.Context, c Call) (bool, error) {
+	cmd, ok := commands[c.Name]
+	if !ok {
+		return false, nil
+	}
+	return true, cmd(ctx, f, c)
+}
+
+// field is one column that a list prints, and how to read it from a row.
+type field[T any] struct {
+	name string
+	// verbose is a column that only the + form of the command prints, and
+	// terse one that only the form without + prints.
+	verbose bool
+	terse   bool
+	value   func(T) any
+	// when, if set, says from the rows whether the column is printed. A
+	// column that no row has a value for is one the database cannot give.
+	when func([]T) bool
+}
+
+// spec is a describe command that prints one list: the rows of one query,
+// under psql's title, in psql's columns.
+type spec[T any] struct {
+	cmd    string
+	title  string
+	q      *dbmeta.Query[T]
+	fields []field[T]
+	// noCount leaves out the count of rows below the list, as psql does for
+	// the roles of \du.
+	noCount bool
+	// operands reads the patterns after the first as the types of the left
+	// and the right operand, as psql's \do does. One type pattern alone is
+	// the right operand of a prefix operator.
+	operands bool
+	// visible, if set, says whether a row is on the search path, for
+	// onPath.
+	visible func(T) sql.Null[bool]
+}
+
+// onPath keeps the rows that psql lists for pattern: with no schema in the
+// pattern, only the objects on the search path.
+func (s spec[T]) onPath(f *Formatter, pattern string, res []T) []T {
+	if s.visible == nil || !f.pathOnly(pattern) {
+		return res
+	}
+	return slices.DeleteFunc(res, func(v T) bool { return hidden(s.visible(v)) })
+}
+
+// named returns the arguments for pattern. It is split into a schema and a
+// name where the query takes a schema.
+func (s spec[T]) named(f *Formatter, pattern string) dbmeta.Args {
+	var a dbmeta.Args
+	if f.takes(s.q, "schema") {
+		a.Schema, a.Name = f.meta.Dialect().Pattern(pattern)
+	} else {
+		a.Name = f.fold(pattern)
+	}
+	return a
+}
+
+// read returns the rows of the query for a.
+func (s spec[T]) read(ctx context.Context, f *Formatter, c Call, a dbmeta.Args) ([]T, error) {
+	a.WithSystem = c.System
+	res, err := all(ctx, f, s.q, a)
+	if err != nil {
+		return nil, f.checkTypes(s.cmd, a.ArgTypes, err)
+	}
+	return res, nil
+}
+
+// print prints res to the output of f.
+func (s spec[T]) print(f *Formatter, res []T, verbose bool) error {
+	r := &rows{}
+	var shown []field[T]
+	for _, f := range s.fields {
+		if (verbose || !f.verbose) && (!verbose || !f.terse) && (f.when == nil || f.when(res)) {
+			shown = append(shown, f)
+			r.columns = append(r.columns, f.name)
+		}
+	}
+	for _, v := range res {
+		var row []any
+		for _, f := range shown {
+			row = append(row, f.value(v))
+		}
+		r.add(row...)
+	}
+	// the rows keep the order of the query, which dbmeta gives in psql's
+	// order and the collation of the database
+	var footer func(io.Writer) error
+	if s.noCount {
+		footer = noFooter
+	}
+	return encode(f.out, r, s.title, footer, f.params())
+}
+
+// list returns the command that prints s.
+func list[T any](s spec[T]) command {
+	return func(ctx context.Context, f *Formatter, c Call) error {
+		a := s.named(f, c.pattern(0))
+		if s.operands && len(c.Patterns) > 1 {
+			types := c.Patterns[1:]
+			if len(types) == 1 {
+				types = []string{"-", types[0]}
+			}
+			a.ArgTypes = f.typePatterns(types)
+		}
+		res, err := s.read(ctx, f, c, a)
+		if err != nil {
+			return err
+		}
+		return s.print(f, s.onPath(f, c.pattern(0), res), c.Verbose)
+	}
+}
+
+// byAccessMethod returns the command that prints s, for the \dA commands,
+// whose first pattern matches the access method and whose second matches
+// the name.
+func byAccessMethod[T any](s spec[T]) command {
+	return func(ctx context.Context, f *Formatter, c Call) error {
+		a := dbmeta.Args{AccessMethod: f.fold(c.pattern(0)), Name: f.fold(c.pattern(1))}
+		res, err := s.read(ctx, f, c, a)
+		if err != nil {
+			return err
+		}
+		return s.print(f, res, c.Verbose)
+	}
+}
+
+// takes reports whether q takes the parameter named name.
+func (f *Formatter) takes(q dbmeta.AnyQuery, name string) bool {
+	params, err := q.Params(f.meta)
+	if err != nil {
+		return false
+	}
+	return slices.ContainsFunc(params, func(p dbmeta.Param) bool {
+		return p.Name == name
+	})
+}
+
+// fold returns a pattern for an object that no schema holds, such as a role,
+// folded as the database folds a name that is not quoted.
+func (f *Formatter) fold(pattern string) string {
+	return like(f.meta.Dialect().FoldIdentifier(pattern))
+}
+
+// tf returns a boolean the way psql prints one.
+func tf(b bool) string {
+	if b {
+		return "t"
+	}
+	return "f"
+}
+
+// yesNo returns a boolean the way psql prints one it computes, such as
+// Default?.
+func yesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
+// nullYesNo is yesNo, or an empty string for NULL.
+func nullYesNo(b sql.Null[bool]) string {
+	if !b.Valid {
+		return ""
+	}
+	return yesNo(b.V)
+}
+
+// The columns that most lists share.
+func description[T any](f func(T) sql.Null[string]) field[T] {
+	return field[T]{name: "Description", value: func(v T) any { return null(f(v)) }}
+}
+
+func verboseDescription[T any](f func(T) sql.Null[string]) field[T] {
+	return field[T]{name: "Description", verbose: true, value: func(v T) any { return null(f(v)) }}
+}
+
+func accessPrivileges[T any](f func(T) sql.Null[string]) field[T] {
+	return field[T]{name: "Access privileges", verbose: true, value: func(v T) any { return null(f(v)) }}
+}
+
+var types = withElements(spec[dbmeta.Type]{
+	cmd: `\dT`, title: text.ListOfTypes, q: dbmeta.Types,
+	visible: func(t dbmeta.Type) sql.Null[bool] { return t.Visible },
+	fields: []field[dbmeta.Type]{
+		{name: "Schema", value: func(t dbmeta.Type) any { return t.Schema }},
+		{name: "Name", value: func(t dbmeta.Type) any { return t.Name }},
+		{name: "Internal name", verbose: true, value: func(t dbmeta.Type) any { return t.Internal }},
+		{name: "Size", verbose: true, value: func(t dbmeta.Type) any { return null(t.Size) }},
+		{name: "Elements", verbose: true, value: func(t dbmeta.Type) any { return t.Elements }},
+		{name: "Owner", verbose: true, value: func(t dbmeta.Type) any { return null(t.Owner) }},
+		accessPrivileges(func(t dbmeta.Type) sql.Null[string] { return t.Access }),
+		description(func(t dbmeta.Type) sql.Null[string] { return t.Comment }),
+	},
+})
+
+var domains = list(spec[dbmeta.Domain]{
+	cmd: `\dD`, title: text.ListOfDomains, q: dbmeta.Domains,
+	visible: func(d dbmeta.Domain) sql.Null[bool] { return d.Visible },
+	fields: []field[dbmeta.Domain]{
+		{name: "Schema", value: func(d dbmeta.Domain) any { return d.Schema }},
+		{name: "Name", value: func(d dbmeta.Domain) any { return d.Name }},
+		{name: "Type", value: func(d dbmeta.Domain) any { return d.DataType }},
+		{name: "Collation", value: func(d dbmeta.Domain) any { return d.Collation }},
+		{name: "Nullable", value: func(d dbmeta.Domain) any { return notNull(d.Nullable) }},
+		{name: "Default", value: func(d dbmeta.Domain) any { return null(d.Default) }},
+		{name: "Check", value: func(d dbmeta.Domain) any { return d.Constraints }},
+		accessPrivileges(func(d dbmeta.Domain) sql.Null[string] { return d.Access }),
+		verboseDescription(func(d dbmeta.Domain) sql.Null[string] { return d.Comment }),
+	},
+})
+
+// notNull returns what psql prints in the Nullable column.
+func notNull(nullable bool) string {
+	if nullable {
+		return ""
+	}
+	return "not null"
+}
+
+var operators = list(spec[dbmeta.Operator]{
+	cmd: `\do`, title: text.ListOfOperators, q: dbmeta.Operators, operands: true,
+	fields: []field[dbmeta.Operator]{
+		{name: "Schema", value: func(o dbmeta.Operator) any { return o.Schema }},
+		{name: "Name", value: func(o dbmeta.Operator) any { return o.Name }},
+		{name: "Left arg type", value: func(o dbmeta.Operator) any { return o.LeftType }},
+		{name: "Right arg type", value: func(o dbmeta.Operator) any { return o.RightType }},
+		{name: "Result type", value: func(o dbmeta.Operator) any { return o.ResultType }},
+		{name: "Function", verbose: true, value: func(o dbmeta.Operator) any { return null(o.Function) }},
+		{name: "Leakproof?", verbose: true, value: func(o dbmeta.Operator) any { return yesNo(o.Leakproof) },
+			when: func(os []dbmeta.Operator) bool {
+				return some(os, func(o dbmeta.Operator) bool { return o.Function.Valid })
+			}},
+		description(func(o dbmeta.Operator) sql.Null[string] { return o.Comment }),
+	},
+})
+
+var casts = list(spec[dbmeta.Cast]{
+	cmd: `\dC`, title: text.ListOfCasts, q: dbmeta.Casts,
+	fields: []field[dbmeta.Cast]{
+		{name: "Source type", value: func(c dbmeta.Cast) any { return c.Source }},
+		{name: "Target type", value: func(c dbmeta.Cast) any { return c.Target }},
+		{name: "Function", value: func(c dbmeta.Cast) any { return null(c.Function) }},
+		{name: "Implicit?", value: func(c dbmeta.Cast) any { return c.Implicit }},
+		// a cast with no function, such as a binary coercible one, is not
+		// leakproof, as psql says
+		{name: "Leakproof?", verbose: true, value: func(c dbmeta.Cast) any { return yesNo(c.LeakProof.V) }},
+		verboseDescription(func(c dbmeta.Cast) sql.Null[string] { return c.Comment }),
+	},
+})
+
+var languages = list(spec[dbmeta.Language]{
+	cmd: `\dL`, title: text.ListOfLanguages, q: dbmeta.Languages,
+	fields: []field[dbmeta.Language]{
+		{name: "Name", value: func(l dbmeta.Language) any { return l.Name }},
+		{name: "Owner", value: func(l dbmeta.Language) any { return l.Owner }},
+		{name: "Trusted", value: func(l dbmeta.Language) any { return tf(l.Trusted) }},
+		{name: "Internal language", verbose: true, value: func(l dbmeta.Language) any { return tf(l.Internal) }},
+		{name: "Call handler", verbose: true, value: func(l dbmeta.Language) any { return l.Handler }},
+		{name: "Validator", verbose: true, value: func(l dbmeta.Language) any { return l.Validator }},
+		{name: "Inline handler", verbose: true, value: func(l dbmeta.Language) any { return l.Inline }},
+		accessPrivileges(func(l dbmeta.Language) sql.Null[string] { return l.Access }),
+		description(func(l dbmeta.Language) sql.Null[string] { return l.Comment }),
+	},
+})
+
+var roles = list(spec[dbmeta.Role]{
+	cmd: `\du`, title: text.ListOfRoles, q: dbmeta.Roles, noCount: true,
+	fields: []field[dbmeta.Role]{
+		{name: "Role name", value: func(r dbmeta.Role) any { return r.Name }},
+		{name: "Attributes", value: func(r dbmeta.Role) any { return attributes(r) }},
+		verboseDescription(func(r dbmeta.Role) sql.Null[string] { return r.Comment }),
+	},
+})
+
+// attributes returns the attributes of a role, the way psql 16 and later
+// prints them.
+func attributes(r dbmeta.Role) string {
+	var v []string
+	add := func(ok bool, s string) {
+		if ok {
+			v = append(v, s)
+		}
+	}
+	add(r.Superuser, "Superuser")
+	add(!r.Inherit, "No inheritance")
+	add(r.CreateRole, "Create role")
+	add(r.CreateDB, "Create DB")
+	add(!r.CanLogin, "Cannot login")
+	add(r.Replication, "Replication")
+	add(r.BypassRLS, "Bypass RLS")
+	switch {
+	case r.ConnLimit == 1:
+		v = append(v, "1 connection")
+	case r.ConnLimit >= 0:
+		v = append(v, strconv.FormatInt(r.ConnLimit, 10)+" connections")
+	}
+	add(r.ValidUntil.Valid, "Password valid until "+r.ValidUntil.V)
+	return strings.Join(v, ", ")
+}
+
+var roleSettings = func(ctx context.Context, f *Formatter, c Call) error {
+	s := spec[dbmeta.RoleSetting]{
+		cmd: `\drds`, title: text.ListOfRoleSettings, q: dbmeta.RoleSettings,
+		fields: []field[dbmeta.RoleSetting]{
+			{name: "Role", value: func(r dbmeta.RoleSetting) any { return r.Role }},
+			{name: "Database", value: func(r dbmeta.RoleSetting) any { return r.Database }},
+			{name: "Settings", value: func(r dbmeta.RoleSetting) any { return null(r.Settings) }},
+		},
+	}
+	a := s.named(f, c.pattern(0))
+	a.Database = f.fold(c.pattern(1))
+	res, err := s.read(ctx, f, c, a)
+	if err != nil {
+		return err
+	}
+	// psql prints a line in place of an empty list
+	if len(res) == 0 {
+		var err error
+		switch role, db := c.pattern(0), c.pattern(1); {
+		case role != "" && db != "":
+			_, err = fmt.Fprintf(f.out, text.NoRoleSettingsFound+"\n", role, db)
+		case role != "":
+			_, err = fmt.Fprintf(f.out, text.NoRoleSettingsFoundRole+"\n", role)
+		default:
+			_, err = fmt.Fprintln(f.out, text.NoRoleSettingsFoundAny)
+		}
+		return err
+	}
+	return s.print(f, res, c.Verbose)
+}
+
+var roleGrants = list(spec[dbmeta.RoleGrant]{
+	cmd: `\drg`, title: text.ListOfRoleGrants, q: dbmeta.RoleGrants,
+	fields: []field[dbmeta.RoleGrant]{
+		{name: "Role name", value: func(r dbmeta.RoleGrant) any { return r.Role }},
+		{name: "Member of", value: func(r dbmeta.RoleGrant) any { return r.MemberOf }},
+		{name: "Options", value: func(r dbmeta.RoleGrant) any { return grantOptions(r) }},
+		{name: "Grantor", value: func(r dbmeta.RoleGrant) any { return null(r.Grantor) }},
+	},
+})
+
+// grantOptions returns the options of a role grant, the way psql prints them.
+func grantOptions(r dbmeta.RoleGrant) string {
+	var v []string
+	if r.Admin {
+		v = append(v, "ADMIN")
+	}
+	if r.Inherit {
+		v = append(v, "INHERIT")
+	}
+	if r.Set {
+		v = append(v, "SET")
+	}
+	return strings.Join(v, ", ")
+}
+
+var defaultACLs = list(spec[dbmeta.DefaultACL]{
+	cmd: `\ddp`, title: text.DefaultAccessPrivileges, q: dbmeta.DefaultACLs,
+	fields: []field[dbmeta.DefaultACL]{
+		{name: "Owner", value: func(d dbmeta.DefaultACL) any { return d.Owner }},
+		{name: "Schema", value: func(d dbmeta.DefaultACL) any { return d.Schema }},
+		{name: "Type", value: func(d dbmeta.DefaultACL) any { return d.Type }},
+		{name: "Access privileges", value: func(d dbmeta.DefaultACL) any { return null(d.Access) }},
+	},
+})
+
+var tablespaces = list(spec[dbmeta.Tablespace]{
+	cmd: `\db`, title: text.ListOfTablespaces, q: dbmeta.Tablespaces,
+	fields: []field[dbmeta.Tablespace]{
+		{name: "Name", value: func(t dbmeta.Tablespace) any { return t.Name }},
+		{name: "Owner", value: func(t dbmeta.Tablespace) any { return null(t.Owner) }},
+		{name: "Location", value: func(t dbmeta.Tablespace) any { return null(t.Location) }},
+		accessPrivileges(func(t dbmeta.Tablespace) sql.Null[string] { return t.Access }),
+		{name: "Options", verbose: true, value: func(t dbmeta.Tablespace) any { return null(t.Options) }},
+		{name: "Size", verbose: true, value: func(t dbmeta.Tablespace) any { return null(t.Size) }},
+		verboseDescription(func(t dbmeta.Tablespace) sql.Null[string] { return t.Comment }),
+	},
+})
+
+var accessMethods = list(spec[dbmeta.AccessMethod]{
+	cmd: `\dA`, title: text.ListOfAccessMethods, q: dbmeta.AccessMethods,
+	fields: []field[dbmeta.AccessMethod]{
+		{name: "Name", value: func(a dbmeta.AccessMethod) any { return a.Name }},
+		// psql writes the type with a capital, as in Index and Table
+		{name: "Type", value: func(a dbmeta.AccessMethod) any { return capitalize(a.Type) }},
+		{name: "Handler", verbose: true, value: func(a dbmeta.AccessMethod) any { return null(a.Handler) }},
+		verboseDescription(func(a dbmeta.AccessMethod) sql.Null[string] { return a.Comment }),
+	},
+})
+
+var collations = list(spec[dbmeta.Collation]{
+	cmd: `\dO`, title: text.ListOfCollations, q: dbmeta.Collations,
+	fields: []field[dbmeta.Collation]{
+		{name: "Schema", value: func(c dbmeta.Collation) any { return c.Schema }},
+		{name: "Name", value: func(c dbmeta.Collation) any { return c.Name }},
+		{name: "Provider", value: func(c dbmeta.Collation) any { return null(c.Provider) }},
+		{name: "Collate", value: func(c dbmeta.Collation) any { return null(c.Collate) }},
+		{name: "Ctype", value: func(c dbmeta.Collation) any { return null(c.CType) }},
+		{name: "Locale", value: func(c dbmeta.Collation) any { return null(c.Locale) }},
+		{name: "ICU Rules", value: func(c dbmeta.Collation) any { return null(c.Rules) }},
+		{name: "Deterministic?", value: func(c dbmeta.Collation) any { return nullYesNo(c.Deterministic) }},
+		verboseDescription(func(c dbmeta.Collation) sql.Null[string] { return c.Comment }),
+	},
+})
+
+var conversions = list(spec[dbmeta.Conversion]{
+	cmd: `\dc`, title: text.ListOfConversions, q: dbmeta.Conversions,
+	fields: []field[dbmeta.Conversion]{
+		{name: "Schema", value: func(c dbmeta.Conversion) any { return c.Schema }},
+		{name: "Name", value: func(c dbmeta.Conversion) any { return c.Name }},
+		{name: "Source", value: func(c dbmeta.Conversion) any { return c.Source }},
+		{name: "Destination", value: func(c dbmeta.Conversion) any { return c.Target }},
+		{name: "Default?", value: func(c dbmeta.Conversion) any { return yesNo(c.Default) }},
+		verboseDescription(func(c dbmeta.Conversion) sql.Null[string] { return c.Comment }),
+	},
+})
+
+var largeObjects = list(spec[dbmeta.LargeObject]{
+	cmd: `\dl`, title: text.LargeObjects, q: dbmeta.LargeObjects,
+	fields: []field[dbmeta.LargeObject]{
+		{name: "ID", value: func(l dbmeta.LargeObject) any { return l.OID }},
+		{name: "Owner", value: func(l dbmeta.LargeObject) any { return l.Owner }},
+		accessPrivileges(func(l dbmeta.LargeObject) sql.Null[string] { return l.Access }),
+		description(func(l dbmeta.LargeObject) sql.Null[string] { return l.Comment }),
+	},
+})
+
+// settings prints \dconfig. With no pattern, psql lists only the settings
+// whose value does not come from the default and is not the value the server
+// started with, under its own title.
+var settings = func(ctx context.Context, f *Formatter, c Call) error {
+	res, err := settingList.read(ctx, f, c, settingList.named(f, c.pattern(0)))
+	switch {
+	case err != nil:
+		return err
+	case c.pattern(0) != "" || !some(res, func(s dbmeta.Setting) bool { return s.Source.Valid }):
+		// a database that does not say where a value came from lists all
+		return settingList.print(f, res, c.Verbose)
+	}
+	res = slices.DeleteFunc(res, func(s dbmeta.Setting) bool {
+		return s.Source.V == "default" || s.Value == s.Boot
+	})
+	s := settingList
+	s.title = text.ListOfNonDefaultSettings
+	return s.print(f, res, c.Verbose)
+}
+
+var settingList = spec[dbmeta.Setting]{
+	cmd: `\dconfig`, title: text.ListOfSettings, q: dbmeta.Settings,
+	fields: []field[dbmeta.Setting]{
+		{name: "Parameter", value: func(s dbmeta.Setting) any { return s.Name }},
+		{name: "Value", value: func(s dbmeta.Setting) any { return cmp.Or(null(s.Display), null(s.Value)) }},
+		{name: "Type", verbose: true, value: func(s dbmeta.Setting) any { return null(s.Type) }},
+		{name: "Context", verbose: true, value: func(s dbmeta.Setting) any { return null(s.Context) }},
+		accessPrivileges(func(s dbmeta.Setting) sql.Null[string] { return s.Access }),
+	},
+}
+
+// comments prints \dd. psql lists the descriptions of the objects that have
+// no list of their own, and not those of relations, which \d+ prints.
+var comments = func(ctx context.Context, f *Formatter, c Call) error {
+	res, err := commentList.read(ctx, f, c, commentList.named(f, c.pattern(0)))
+	if err != nil {
+		return err
+	}
+	res = slices.DeleteFunc(commentList.onPath(f, c.pattern(0), res), func(c dbmeta.Comment) bool {
+		switch c.Type {
+		case "table constraint", "domain constraint", "operator class", "operator family", "rule", "trigger":
+			return false
+		}
+		return true
+	})
+	return commentList.print(f, res, c.Verbose)
+}
+
+var commentList = spec[dbmeta.Comment]{
+	cmd: `\dd`, title: text.ObjectDescriptions, q: dbmeta.Comments,
+	visible: func(c dbmeta.Comment) sql.Null[bool] { return c.Visible },
+	fields: []field[dbmeta.Comment]{
+		{name: "Schema", value: func(c dbmeta.Comment) any { return c.Schema }},
+		{name: "Name", value: func(c dbmeta.Comment) any { return c.Name }},
+		{name: "Object", value: func(c dbmeta.Comment) any { return c.Type }},
+		{name: "Description", value: func(c dbmeta.Comment) any { return c.Comment }},
+	},
+}
+
+var eventTriggers = list(spec[dbmeta.EventTrigger]{
+	cmd: `\dy`, title: text.ListOfEventTriggers, q: dbmeta.EventTriggers,
+	fields: []field[dbmeta.EventTrigger]{
+		{name: "Name", value: func(e dbmeta.EventTrigger) any { return e.Name }},
+		{name: "Event", value: func(e dbmeta.EventTrigger) any { return e.Event }},
+		{name: "Owner", value: func(e dbmeta.EventTrigger) any { return e.Owner }},
+		{name: "Enabled", value: func(e dbmeta.EventTrigger) any { return e.Enabled }},
+		{name: "Function", value: func(e dbmeta.EventTrigger) any { return e.Function }},
+		{name: "Tags", value: func(e dbmeta.EventTrigger) any { return null(e.Tags) }},
+		verboseDescription(func(e dbmeta.EventTrigger) sql.Null[string] { return e.Comment }),
+	},
+})
+
+var extendedStats = list(spec[dbmeta.ExtendedStat]{
+	cmd: `\dX`, title: text.ListOfExtendedStats, q: dbmeta.ExtendedStats,
+	fields: []field[dbmeta.ExtendedStat]{
+		{name: "Schema", value: func(e dbmeta.ExtendedStat) any { return e.Schema }},
+		{name: "Name", value: func(e dbmeta.ExtendedStat) any { return null(e.Name) }},
+		{name: "Definition", value: func(e dbmeta.ExtendedStat) any { return null(e.Definition) }},
+		{name: "Ndistinct", value: func(e dbmeta.ExtendedStat) any { return defined(e.Ndistinct) }},
+		{name: "Dependencies", value: func(e dbmeta.ExtendedStat) any { return defined(e.Dependencies) }},
+		{name: "MCV", value: func(e dbmeta.ExtendedStat) any { return defined(e.MCV) }},
+	},
+})
+
+// defined returns what psql prints for a kind of extended statistics.
+func defined(b bool) string {
+	if b {
+		return "defined"
+	}
+	return ""
+}
+
+var foreignDataWrappers = withOptions("foreign data wrapper", func(f dbmeta.ForeignDataWrapper) string { return f.Name }, spec[dbmeta.ForeignDataWrapper]{
+	cmd: `\dew`, title: text.ListOfForeignDataWrappers, q: dbmeta.ForeignDataWrappers,
+	fields: []field[dbmeta.ForeignDataWrapper]{
+		{name: "Name", value: func(f dbmeta.ForeignDataWrapper) any { return f.Name }},
+		{name: "Owner", value: func(f dbmeta.ForeignDataWrapper) any { return f.Owner }},
+		{name: "Handler", value: func(f dbmeta.ForeignDataWrapper) any { return null(f.Handler) }},
+		{name: "Validator", value: func(f dbmeta.ForeignDataWrapper) any { return null(f.Validator) }},
+		accessPrivileges(func(f dbmeta.ForeignDataWrapper) sql.Null[string] { return f.Access }),
+		{name: "FDW options", verbose: true, value: func(f dbmeta.ForeignDataWrapper) any { return null(f.Options) }},
+		verboseDescription(func(f dbmeta.ForeignDataWrapper) sql.Null[string] { return f.Comment }),
+	},
+})
+
+var foreignServers = withOptions("foreign server", func(f dbmeta.ForeignServer) string { return f.Name }, spec[dbmeta.ForeignServer]{
+	cmd: `\des`, title: text.ListOfForeignServers, q: dbmeta.ForeignServers,
+	fields: []field[dbmeta.ForeignServer]{
+		{name: "Name", value: func(f dbmeta.ForeignServer) any { return f.Name }},
+		{name: "Owner", value: func(f dbmeta.ForeignServer) any { return f.Owner }},
+		{name: "Foreign-data wrapper", value: func(f dbmeta.ForeignServer) any { return f.Wrapper }},
+		accessPrivileges(func(f dbmeta.ForeignServer) sql.Null[string] { return f.Access }),
+		{name: "Type", verbose: true, value: func(f dbmeta.ForeignServer) any { return null(f.Type) }},
+		{name: "Version", verbose: true, value: func(f dbmeta.ForeignServer) any { return null(f.Version) }},
+		{name: "FDW options", verbose: true, value: func(f dbmeta.ForeignServer) any { return null(f.Options) }},
+		verboseDescription(func(f dbmeta.ForeignServer) sql.Null[string] { return f.Comment }),
+	},
+})
+
+var userMappings = withOptions("user mapping", func(u dbmeta.UserMapping) string { return u.Server + "\x00" + null(u.Name) }, spec[dbmeta.UserMapping]{
+	cmd: `\deu`, title: text.ListOfUserMappings, q: dbmeta.UserMappings,
+	fields: []field[dbmeta.UserMapping]{
+		{name: "Server", value: func(u dbmeta.UserMapping) any { return u.Server }},
+		{name: "User name", value: func(u dbmeta.UserMapping) any { return null(u.Name) }},
+		{name: "FDW options", verbose: true, value: func(u dbmeta.UserMapping) any { return null(u.Options) }},
+	},
+})
+
+var foreignTables = withOptions("foreign table", func(f dbmeta.ForeignTable) string { return f.Schema + "\x00" + f.Name }, spec[dbmeta.ForeignTable]{
+	cmd: `\det`, title: text.ListOfForeignTables, q: dbmeta.ForeignTables,
+	fields: []field[dbmeta.ForeignTable]{
+		{name: "Schema", value: func(f dbmeta.ForeignTable) any { return f.Schema }},
+		{name: "Table", value: func(f dbmeta.ForeignTable) any { return f.Name }},
+		{name: "Server", value: func(f dbmeta.ForeignTable) any { return f.Server }},
+		{name: "FDW options", verbose: true, value: func(f dbmeta.ForeignTable) any { return null(f.Options) }},
+		verboseDescription(func(f dbmeta.ForeignTable) sql.Null[string] { return f.Comment }),
+	},
+})
+
+var partitionedSpec = spec[dbmeta.PartitionedTable]{
+	cmd: `\dP`, title: text.ListOfPartitionedRels, q: dbmeta.PartitionedTables,
+	visible: func(p dbmeta.PartitionedTable) sql.Null[bool] { return p.Visible },
+	fields: []field[dbmeta.PartitionedTable]{
+		{name: "Schema", value: func(p dbmeta.PartitionedTable) any { return p.Schema }},
+		{name: "Name", value: func(p dbmeta.PartitionedTable) any { return p.Name }},
+		{name: "Owner", value: func(p dbmeta.PartitionedTable) any { return p.Owner }},
+		{name: "Type", value: func(p dbmeta.PartitionedTable) any { return partitionedType(p.Type) }},
+		{name: "Parent name", value: func(p dbmeta.PartitionedTable) any { return p.Parent }},
+		{name: "Table", value: func(p dbmeta.PartitionedTable) any { return null(p.Table) },
+			when: sizes},
+		{name: "Access method", verbose: true, value: func(p dbmeta.PartitionedTable) any { return null(p.AccessMethod) },
+			when: sizes},
+		{name: "Leaf partition size", verbose: true, value: func(p dbmeta.PartitionedTable) any { return size(p.DirectSize) },
+			when: sizes},
+		{name: "Total size", verbose: true, value: func(p dbmeta.PartitionedTable) any { return size(p.TotalSize) },
+			when: sizes},
+		verboseDescription(func(p dbmeta.PartitionedTable) sql.Null[string] { return p.Comment }),
+	},
+}
+
+// capitalize returns s with its first letter in upper case.
+func capitalize(s string) string {
+	r, n := utf8.DecodeRuneInString(s)
+	return string(unicode.ToUpper(r)) + s[n:]
+}
+
+// present returns a when for a column that only some releases have: it is
+// printed when a row has a value, or when there are no rows, as psql prints
+// its columns over an empty list.
+func present[T any](valid func(T) bool) func([]T) bool {
+	return func(ts []T) bool {
+		return len(ts) == 0 || some(ts, valid)
+	}
+}
+
+// sizes reports whether the database gives the sizes of its partitioned
+// relations, and with them their tables and access methods. With no rows,
+// the columns are psql's.
+func sizes(ps []dbmeta.PartitionedTable) bool {
+	return len(ps) == 0 || some(ps, func(p dbmeta.PartitionedTable) bool { return p.TotalSize.Valid })
+}
+
+// partitionedTables prints \dP. The letters after it choose indexes (i),
+// tables (t) and, with n, the partitions that are partitioned themselves,
+// which psql shows with the name of their parent. A pattern shows them too.
+// psql's title and Type column follow the letters: one of t and i lists one
+// kind, under its own title and with no Type.
+func partitionedTables(ctx context.Context, f *Formatter, c Call) error {
+	res, err := partitionedSpec.read(ctx, f, c, partitionedSpec.named(f, c.pattern(0)))
+	if err != nil {
+		return err
+	}
+	res = partitionedSpec.onPath(f, c.pattern(0), res)
+	nested := strings.Contains(c.Flags, "n")
+	parents := nested || c.pattern(0) != ""
+	indexes, tables := strings.Contains(c.Flags, "i"), strings.Contains(c.Flags, "t")
+	spec := partitionedSpec
+	switch {
+	case tables && !indexes:
+		spec.title = text.ListOfPartitionedTables
+	case indexes && !tables:
+		spec.title = text.ListOfPartitionedIndexes
+	default:
+		indexes, tables = true, true
+	}
+	mixed := indexes && tables
+	res = slices.DeleteFunc(res, func(p dbmeta.PartitionedTable) bool {
+		isIndex := strings.Contains(strings.ToLower(p.Type), "index")
+		switch {
+		case !parents && p.Parent != "":
+			return true
+		case !mixed && indexes:
+			return !isIndex
+		case !mixed && tables:
+			return isIndex
+		}
+		return false
+	})
+	spec.fields = slices.DeleteFunc(slices.Clone(spec.fields), func(f field[dbmeta.PartitionedTable]) bool {
+		switch f.name {
+		case "Type":
+			return !mixed
+		case "Parent name":
+			return !parents
+		case "Table":
+			// only a list that holds indexes has a table to name
+			return !indexes
+		case "Leaf partition size":
+			return !nested
+		}
+		return false
+	})
+	return spec.print(f, res, c.Verbose)
+}
+
+// publicationList is the list that \dRp prints. \dRp+ prints each
+// publication with its tables instead.
+var publicationList = spec[dbmeta.Publication]{
+	cmd: `\dRp`, title: text.ListOfPublications, q: dbmeta.Publications,
+	fields: []field[dbmeta.Publication]{
+		{name: "Name", value: func(p dbmeta.Publication) any { return p.Name }},
+		{name: "Owner", value: func(p dbmeta.Publication) any { return p.Owner }},
+		{name: "All tables", value: func(p dbmeta.Publication) any { return tf(p.AllTables) }},
+		{name: "Inserts", value: func(p dbmeta.Publication) any { return tf(p.Insert) }},
+		{name: "Updates", value: func(p dbmeta.Publication) any { return tf(p.Update) }},
+		{name: "Deletes", value: func(p dbmeta.Publication) any { return tf(p.Delete) }},
+		{name: "Truncates", value: func(p dbmeta.Publication) any { return tf(p.Truncate) }},
+		{name: "Generated columns", value: func(p dbmeta.Publication) any { return null(p.GeneratedColumns) },
+			when: present(func(p dbmeta.Publication) bool { return p.GeneratedColumns.Valid })},
+		{name: "Via root", value: func(p dbmeta.Publication) any { return tf(p.ViaRoot) }},
+	},
+}
+
+func publications(ctx context.Context, f *Formatter, c Call) error {
+	pubs, err := publicationList.read(ctx, f, c, publicationList.named(f, c.pattern(0)))
+	switch {
+	case err != nil:
+		return err
+	case !c.Verbose:
+		return publicationList.print(f, pubs, false)
+	case len(pubs) == 0 && c.pattern(0) != "":
+		_, err := fmt.Fprintf(f.out, text.PublicationNotFound+"\n", c.pattern(0))
+		return err
+	case len(pubs) == 0:
+		_, err := fmt.Fprintln(f.out, text.NoPublicationsFound)
+		return err
+	}
+	slices.SortStableFunc(pubs, func(a, b dbmeta.Publication) int {
+		return cmp.Compare(a.Name, b.Name)
+	})
+	for _, p := range pubs {
+		tables, err := optional(all(ctx, f, dbmeta.PublicationTables, dbmeta.Args{Name: p.Name}))
+		if err != nil {
+			return err
+		}
+		var lines []string
+		for _, t := range tables {
+			if t.Publication != p.Name {
+				continue
+			}
+			s := qualified(t.Schema, t.Name)
+			if t.Columns != "" {
+				s += " (" + t.Columns + ")"
+			}
+			if t.Where.Valid {
+				s += " WHERE " + t.Where.V
+			}
+			lines = append(lines, "    "+s)
+		}
+		slices.Sort(lines)
+		footer := noFooter
+		if len(lines) != 0 {
+			footer = func(out io.Writer) error {
+				_, err := fmt.Fprintln(out, "Tables:\n"+strings.Join(lines, "\n"))
+				return err
+			}
+		}
+		// the title names the publication, so the columns leave it out
+		r := &rows{}
+		var row []any
+		for _, f := range publicationList.fields[1:] {
+			r.columns = append(r.columns, f.name)
+			row = append(row, f.value(p))
+		}
+		r.add(row...)
+		if err := encode(f.out, r, fmt.Sprintf(text.Publication, p.Name), footer, f.params()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// subscriptionList is the list that \dRs prints. A column that a release
+// does not have is left out, unless there are no rows, where the columns are
+// psql's.
+var subscriptionList = spec[dbmeta.Subscription]{
+	cmd: `\dRs`, title: text.ListOfSubscriptions, q: dbmeta.Subscriptions,
+	fields: []field[dbmeta.Subscription]{
+		{name: "Name", value: func(s dbmeta.Subscription) any { return s.Name }},
+		{name: "Owner", value: func(s dbmeta.Subscription) any { return s.Owner }},
+		{name: "Enabled", value: func(s dbmeta.Subscription) any { return tf(s.Enabled) }},
+		{name: "Publication", value: func(s dbmeta.Subscription) any { return s.Publications }},
+		{name: "Binary", verbose: true, value: func(s dbmeta.Subscription) any { return nullTF(s.Binary) },
+			when: present(func(s dbmeta.Subscription) bool { return s.Binary.Valid })},
+		{name: "Streaming", verbose: true, value: func(s dbmeta.Subscription) any { return null(s.Streaming) },
+			when: present(func(s dbmeta.Subscription) bool { return s.Streaming.Valid })},
+		{name: "Two-phase commit", verbose: true, value: func(s dbmeta.Subscription) any { return null(s.TwoPhase) },
+			when: present(func(s dbmeta.Subscription) bool { return s.TwoPhase.Valid })},
+		{name: "Disable on error", verbose: true, value: func(s dbmeta.Subscription) any { return nullTF(s.DisableOnError) },
+			when: present(func(s dbmeta.Subscription) bool { return s.DisableOnError.Valid })},
+		{name: "Origin", verbose: true, value: func(s dbmeta.Subscription) any { return null(s.Origin) },
+			when: present(func(s dbmeta.Subscription) bool { return s.Origin.Valid })},
+		{name: "Password required", verbose: true, value: func(s dbmeta.Subscription) any { return nullTF(s.PasswordRequired) },
+			when: present(func(s dbmeta.Subscription) bool { return s.PasswordRequired.Valid })},
+		{name: "Run as owner?", verbose: true, value: func(s dbmeta.Subscription) any { return nullTF(s.RunAsOwner) },
+			when: present(func(s dbmeta.Subscription) bool { return s.RunAsOwner.Valid })},
+		{name: "Failover", verbose: true, value: func(s dbmeta.Subscription) any { return nullTF(s.Failover) },
+			when: present(func(s dbmeta.Subscription) bool { return s.Failover.Valid })},
+		{name: "Synchronous commit", verbose: true, value: func(s dbmeta.Subscription) any { return null(s.Synchronous) }},
+		{name: "Conninfo", verbose: true, value: func(s dbmeta.Subscription) any { return "" }},
+		{name: "Skip LSN", verbose: true, value: func(s dbmeta.Subscription) any { return null(s.SkipLSN) },
+			when: present(func(s dbmeta.Subscription) bool { return s.SkipLSN.Valid })},
+	},
+}
+
+// subscriptions prints \dRs, and for \dRs+ the connection string of each
+// subscription, which only a role that may read it gets.
+func subscriptions(ctx context.Context, f *Formatter, c Call) error {
+	subs, err := subscriptionList.read(ctx, f, c, subscriptionList.named(f, c.pattern(0)))
+	switch {
+	case err != nil:
+		return err
+	case !c.Verbose:
+		return subscriptionList.print(f, subs, false)
+	}
+	// a role that may not read the connection strings gets none
+	conninfo := make(map[string]string)
+	if f.supports(dbmeta.SubscriptionConnections) {
+		conns, _ := all(ctx, f, dbmeta.SubscriptionConnections, dbmeta.Args{Name: f.fold(c.pattern(0))})
+		for _, sc := range conns {
+			conninfo[sc.Name] = sc.Conninfo
+		}
+	}
+	spec := subscriptionList
+	spec.fields = slices.Clone(spec.fields)
+	for i := range spec.fields {
+		if spec.fields[i].name == "Conninfo" {
+			spec.fields[i].value = func(s dbmeta.Subscription) any { return conninfo[s.Name] }
+		}
+	}
+	return spec.print(f, subs, true)
+}
+
+// configList is the list that \dF prints. \dF+ prints the token map of each
+// configuration instead.
+var configList = spec[dbmeta.TextSearchConfig]{
+	cmd: `\dF`, title: text.ListOfTSConfigs, q: dbmeta.TextSearchConfigs,
+	fields: []field[dbmeta.TextSearchConfig]{
+		{name: "Schema", value: func(t dbmeta.TextSearchConfig) any { return t.Schema }},
+		{name: "Name", value: func(t dbmeta.TextSearchConfig) any { return t.Name }},
+		description(func(t dbmeta.TextSearchConfig) sql.Null[string] { return t.Comment }),
+	},
+}
+
+func textSearchConfigs(ctx context.Context, f *Formatter, c Call) error {
+	configs, err := configList.read(ctx, f, c, configList.named(f, c.pattern(0)))
+	switch {
+	case err != nil:
+		return err
+	case !c.Verbose:
+		return configList.print(f, configs, false)
+	}
+	slices.SortStableFunc(configs, func(a, b dbmeta.TextSearchConfig) int {
+		return cmp.Or(cmp.Compare(a.Schema, b.Schema), cmp.Compare(a.Name, b.Name))
+	})
+	for _, t := range configs {
+		maps, err := all(ctx, f, dbmeta.TextSearchConfigMaps, dbmeta.Args{Schema: t.Schema, Name: t.Name, WithSystem: true})
+		if err != nil {
+			return f.check(`\dF+`, err)
+		}
+		slices.SortStableFunc(maps, func(a, b dbmeta.TextSearchConfigMap) int {
+			return cmp.Or(cmp.Compare(a.Token, b.Token), cmp.Compare(a.Position, b.Position))
+		})
+		// one row for each dictionary, joined into one line for each token
+		r := &rows{columns: []string{"Token", "Dictionaries"}}
+		for _, m := range maps {
+			if m.Config != t.Name || m.Schema != t.Schema {
+				continue
+			}
+			if n := len(r.values); n != 0 && r.values[n-1][0] == m.Token {
+				r.values[n-1][1] = r.values[n-1][1].(string) + "," + m.Dictionary
+				continue
+			}
+			r.add(m.Token, m.Dictionary)
+		}
+		title := fmt.Sprintf(text.TSConfig, t.Schema+"."+t.Name) + "\n" + fmt.Sprintf(text.TSConfigParser, qualify(null(t.ParserSchema), t.Parser))
+		if err := encode(f.out, r, title, noFooter, f.params()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// parserList is the list that \dFp prints. \dFp+ prints the functions and
+// the token types of each parser instead.
+var parserList = spec[dbmeta.TextSearchParser]{
+	cmd: `\dFp`, title: text.ListOfTSParsers, q: dbmeta.TextSearchParsers,
+	fields: []field[dbmeta.TextSearchParser]{
+		{name: "Schema", value: func(t dbmeta.TextSearchParser) any { return t.Schema }},
+		{name: "Name", value: func(t dbmeta.TextSearchParser) any { return t.Name }},
+		description(func(t dbmeta.TextSearchParser) sql.Null[string] { return t.Comment }),
+	},
+}
+
+// parserMethod returns the name that psql gives a method of a text search
+// parser.
+func parserMethod(method string) string {
+	switch method {
+	case "start":
+		return "Start parse"
+	case "token":
+		return "Get next token"
+	case "end":
+		return "End parse"
+	case "headline":
+		return "Get headline"
+	case "lextype":
+		return "Get token types"
+	}
+	return method
+}
+
+func textSearchParsers(ctx context.Context, f *Formatter, c Call) error {
+	parsers, err := parserList.read(ctx, f, c, parserList.named(f, c.pattern(0)))
+	switch {
+	case err != nil:
+		return err
+	case !c.Verbose || !f.supports(dbmeta.TextSearchParserFunctions):
+		return parserList.print(f, parsers, c.Verbose)
+	}
+	slices.SortStableFunc(parsers, func(a, b dbmeta.TextSearchParser) int {
+		return cmp.Or(cmp.Compare(a.Schema, b.Schema), cmp.Compare(a.Name, b.Name))
+	})
+	for _, p := range parsers {
+		a := dbmeta.Args{Schema: p.Schema, Parent: p.Name, WithSystem: true}
+		funcs, err := optional(all(ctx, f, dbmeta.TextSearchParserFunctions, a))
+		if err != nil {
+			return err
+		}
+		funcs = slices.DeleteFunc(funcs, func(fn dbmeta.TextSearchParserFunction) bool {
+			return fn.Schema != p.Schema || fn.Parser != p.Name
+		})
+		slices.SortStableFunc(funcs, func(a, b dbmeta.TextSearchParserFunction) int { return cmp.Compare(a.Ordinal, b.Ordinal) })
+		r := &rows{columns: []string{"Method", "Function", "Description"}}
+		for _, fn := range funcs {
+			r.add(parserMethod(fn.Method), fn.Function, null(fn.Comment))
+		}
+		name := qualify(p.Schema, p.Name)
+		if err := encode(f.out, r, fmt.Sprintf(text.TSParser, name), noFooter, f.params()); err != nil {
+			return err
+		}
+		if !f.supports(dbmeta.TextSearchParserTokenTypes) {
+			continue
+		}
+		tokens, err := optional(all(ctx, f, dbmeta.TextSearchParserTokenTypes, a))
+		if err != nil {
+			return err
+		}
+		r = &rows{columns: []string{"Token name", "Description"}}
+		for _, t := range tokens {
+			if t.Schema == p.Schema && t.Parser == p.Name {
+				r.add(t.Alias, t.Description)
+			}
+		}
+		if err := encode(f.out, r, fmt.Sprintf(text.TSParserTokenTypes, name), nil, f.params()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var textSearchDictionaries = list(spec[dbmeta.TextSearchDictionary]{
+	cmd: `\dFd`, title: text.ListOfTSDictionaries, q: dbmeta.TextSearchDictionaries,
+	fields: []field[dbmeta.TextSearchDictionary]{
+		{name: "Schema", value: func(t dbmeta.TextSearchDictionary) any { return t.Schema }},
+		{name: "Name", value: func(t dbmeta.TextSearchDictionary) any { return t.Name }},
+		{name: "Template", verbose: true, value: func(t dbmeta.TextSearchDictionary) any {
+			if t.TemplateSchema.Valid {
+				return t.TemplateSchema.V + "." + t.Template
+			}
+			return t.Template
+		}},
+		{name: "Init options", verbose: true, value: func(t dbmeta.TextSearchDictionary) any { return null(t.Options) }},
+		description(func(t dbmeta.TextSearchDictionary) sql.Null[string] { return t.Comment }),
+	},
+})
+
+var textSearchTemplates = list(spec[dbmeta.TextSearchTemplate]{
+	cmd: `\dFt`, title: text.ListOfTSTemplates, q: dbmeta.TextSearchTemplates,
+	fields: []field[dbmeta.TextSearchTemplate]{
+		{name: "Schema", value: func(t dbmeta.TextSearchTemplate) any { return t.Schema }},
+		{name: "Name", value: func(t dbmeta.TextSearchTemplate) any { return t.Name }},
+		{name: "Init", verbose: true, value: func(t dbmeta.TextSearchTemplate) any { return null(t.Init) }},
+		{name: "Lexize", verbose: true, value: func(t dbmeta.TextSearchTemplate) any { return t.Lexize }},
+		description(func(t dbmeta.TextSearchTemplate) sql.Null[string] { return t.Comment }),
+	},
+})
+
+var operatorClasses = spec[dbmeta.OperatorClass]{
+	cmd: `\dAc`, title: text.ListOfOperatorClasses, q: dbmeta.OperatorClasses,
+	fields: []field[dbmeta.OperatorClass]{
+		{name: "AM", value: func(o dbmeta.OperatorClass) any { return o.AccessMethod }},
+		{name: "Input type", value: func(o dbmeta.OperatorClass) any { return o.InputType }},
+		{name: "Storage type", value: func(o dbmeta.OperatorClass) any { return null(o.StorageType) }},
+		{name: "Operator class", value: func(o dbmeta.OperatorClass) any { return o.Name }},
+		{name: "Default?", value: func(o dbmeta.OperatorClass) any { return yesNo(o.Default) }},
+		{name: "Operator family", verbose: true, value: func(o dbmeta.OperatorClass) any { return o.Family }},
+		{name: "Owner", verbose: true, value: func(o dbmeta.OperatorClass) any { return o.Owner }},
+	},
+}
+
+var operatorFamilies = spec[dbmeta.OperatorFamily]{
+	cmd: `\dAf`, title: text.ListOfOperatorFamilies, q: dbmeta.OperatorFamilies,
+	fields: []field[dbmeta.OperatorFamily]{
+		{name: "AM", value: func(o dbmeta.OperatorFamily) any { return o.AccessMethod }},
+		{name: "Operator family", value: func(o dbmeta.OperatorFamily) any { return o.Name }},
+		{name: "Applicable types", value: func(o dbmeta.OperatorFamily) any { return null(o.AppliesTo) }},
+		{name: "Owner", verbose: true, value: func(o dbmeta.OperatorFamily) any { return o.Owner }},
+	},
+}
+
+var familyOperators = spec[dbmeta.OperatorFamilyOperator]{
+	cmd: `\dAo`, title: text.ListOfFamilyOperators, q: dbmeta.OperatorFamilyOperators,
+	fields: []field[dbmeta.OperatorFamilyOperator]{
+		{name: "AM", value: func(o dbmeta.OperatorFamilyOperator) any { return o.AccessMethod }},
+		{name: "Operator family", value: func(o dbmeta.OperatorFamilyOperator) any { return o.Family }},
+		{name: "Operator", value: func(o dbmeta.OperatorFamilyOperator) any { return o.Operator }},
+		{name: "Strategy", value: func(o dbmeta.OperatorFamilyOperator) any { return o.Strategy }},
+		{name: "Purpose", value: func(o dbmeta.OperatorFamilyOperator) any { return o.Purpose }},
+		{name: "Sort opfamily", verbose: true, value: func(o dbmeta.OperatorFamilyOperator) any { return null(o.SortFamily) },
+			when: func(os []dbmeta.OperatorFamilyOperator) bool { return len(os) != 0 }},
+		{name: "Leakproof?", verbose: true, value: func(o dbmeta.OperatorFamilyOperator) any { return yesNo(o.Leakproof) },
+			when: func(os []dbmeta.OperatorFamilyOperator) bool { return len(os) != 0 }},
+	},
+}
+
+var familyFunctions = spec[dbmeta.OperatorFamilyFunction]{
+	cmd: `\dAp`, title: text.ListOfFamilyFunctions, q: dbmeta.OperatorFamilyFunctions,
+	fields: []field[dbmeta.OperatorFamilyFunction]{
+		{name: "AM", value: func(o dbmeta.OperatorFamilyFunction) any { return o.AccessMethod }},
+		{name: "Operator family", value: func(o dbmeta.OperatorFamilyFunction) any { return o.Family }},
+		{name: "Registered left type", value: func(o dbmeta.OperatorFamilyFunction) any { return o.LeftType }},
+		{name: "Registered right type", value: func(o dbmeta.OperatorFamilyFunction) any { return o.RightType }},
+		{name: "Number", value: func(o dbmeta.OperatorFamilyFunction) any { return o.Number }},
+		// psql names the function alone, and with its argument types for +
+		{name: "Function", terse: true, value: func(o dbmeta.OperatorFamilyFunction) any { return o.FunctionName }},
+		{name: "Function", verbose: true, value: func(o dbmeta.OperatorFamilyFunction) any { return o.Function }},
+	},
+}
+
+// extensionList is the list that \dx prints. \dx+ prints the objects of each
+// extension instead.
+var extensionList = spec[dbmeta.Extension]{
+	cmd: `\dx`, title: text.ListOfExtensions, q: dbmeta.Extensions,
+	fields: []field[dbmeta.Extension]{
+		{name: "Name", value: func(e dbmeta.Extension) any { return e.Name }},
+		{name: "Version", value: func(e dbmeta.Extension) any { return e.Version }},
+		{name: "Default version", value: func(e dbmeta.Extension) any { return null(e.DefaultVersion) },
+			when: func(es []dbmeta.Extension) bool {
+				return some(es, func(e dbmeta.Extension) bool { return e.DefaultVersion.Valid })
+			}},
+		{name: "Schema", value: func(e dbmeta.Extension) any { return e.Schema }},
+		description(func(e dbmeta.Extension) sql.Null[string] { return e.Comment }),
+	},
+}
+
+func extensions(ctx context.Context, f *Formatter, c Call) error {
+	exts, err := extensionList.read(ctx, f, c, extensionList.named(f, c.pattern(0)))
+	switch {
+	case err != nil:
+		return err
+	case !c.Verbose:
+		return extensionList.print(f, exts, false)
+	}
+	slices.SortStableFunc(exts, func(a, b dbmeta.Extension) int {
+		return cmp.Compare(a.Name, b.Name)
+	})
+	for _, e := range exts {
+		objects, err := all(ctx, f, dbmeta.ExtensionObjects, dbmeta.Args{Name: e.Name})
+		if err != nil {
+			return f.check(`\dx+`, err)
+		}
+		r := &rows{columns: []string{"Object description"}}
+		for _, o := range objects {
+			if o.Extension == e.Name {
+				r.add(o.Description)
+			}
+		}
+		if err := encode(f.out, r, fmt.Sprintf(text.ObjectsInExtension, `"`+e.Name+`"`), nil, f.params()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// qualify returns schema.name, or name when there is no schema.
+func qualify(schema, name string) string {
+	if schema == "" {
+		return name
+	}
+	return schema + "." + name
+}
+
+// ShowFunction prints the definition of the function that name names, for
+// \sf. name may carry the argument types, as in f(integer), to pick one of
+// several functions with the name. verbose numbers the lines of the body.
+func (f *Formatter) ShowFunction(ctx context.Context, name string, verbose bool) error {
+	def, err := f.FunctionDefinition(ctx, name)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(f.colored(def), "\n")
+	// psql numbers the body, and indents the header above it
+	body := FunctionBody(def)
+	for i, line := range lines {
+		switch {
+		case verbose && i < body:
+			line = "        " + line
+		case verbose:
+			line = fmt.Sprintf("%-7d %s", i-body+1, line)
+		}
+		if _, err := fmt.Fprintln(f.out, line); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// FunctionDefinition returns the definition of the function that name
+// names, as \sf prints it and \ef edits it. name may carry the argument
+// types, as in f(integer), to pick one of several functions with the name.
+func (f *Formatter) FunctionDefinition(ctx context.Context, name string) (string, error) {
+	pattern, argTypes, hasArgs := strings.Cut(name, "(")
+	argTypes = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(argTypes), ")"))
+	schema, n := f.meta.Dialect().Pattern(strings.TrimSpace(pattern))
+	funcs, err := all(ctx, f, dbmeta.Functions, dbmeta.Args{Schema: schema, Name: n, WithSystem: true})
+	if err != nil {
+		return "", f.check(`\sf`, err)
+	}
+	var match []dbmeta.Function
+	if hasArgs {
+		want := typeList(strings.Split(argTypes, ","))
+		params, err := f.routineTypes(ctx, schema, n)
+		if err != nil {
+			return "", err
+		}
+		for _, f := range funcs {
+			// the types alone, or the signature as \df prints it
+			if params[null(f.ID)] == want || typeList(strings.Split(null(f.ArgTypes), ",")) == want {
+				match = append(match, f)
+			}
+		}
+	} else {
+		match = funcs
+	}
+	switch {
+	case len(match) == 0:
+		return "", fmt.Errorf(text.FunctionNotFound, name)
+	case len(match) > 1:
+		return "", fmt.Errorf(text.MoreThanOneFunction, name)
+	case !match[0].Definition.Valid:
+		return "", fmt.Errorf(text.FunctionHasNoDefinition, name)
+	}
+	return strings.TrimRight(match[0].Definition.V, "\n"), nil
+}
+
+// FunctionBody returns the index of the line of def where the body of the
+// function starts, which is line 1 for \sf+ and for the LINE of \ef. As in
+// psql, it is the first line that starts with AS, BEGIN or RETURN, or the
+// first line when there is none.
+func FunctionBody(def string) int {
+	i := slices.IndexFunc(strings.Split(def, "\n"), func(s string) bool {
+		for _, prefix := range []string{"AS ", "BEGIN ", "RETURN "} {
+			if _, ok := cutPrefixFold(s, prefix); ok {
+				return true
+			}
+		}
+		return false
+	})
+	return max(i, 0)
+}
+
+// routineTypes returns the types of the arguments of each routine that
+// matches schema and name, keyed by the ID of the routine and written as
+// typeList writes them.
+func (f *Formatter) routineTypes(ctx context.Context, schema, name string) (map[string]string, error) {
+	params, err := optional(all(ctx, f, dbmeta.RoutineParameters, dbmeta.Args{Schema: schema, Parent: name, WithSystem: true}))
+	if err != nil {
+		return nil, err
+	}
+	slices.SortStableFunc(params, func(a, b dbmeta.RoutineParameter) int {
+		return cmp.Compare(a.Ordinal, b.Ordinal)
+	})
+	types := make(map[string][]string)
+	for _, p := range params {
+		switch strings.ToLower(p.Mode) {
+		case "in", "inout", "variadic":
+			id := null(p.RoutineID)
+			types[id] = append(types[id], p.DataType)
+		}
+	}
+	m := make(map[string]string, len(types))
+	for id, v := range types {
+		m[id] = typeList(v)
+	}
+	return m, nil
+}
+
+// typeList returns a list of types in one form, so that two can be compared.
+func typeList(types []string) string {
+	var v []string
+	for _, t := range types {
+		if t = strings.ToLower(strings.Join(strings.Fields(t), " ")); t != "" {
+			v = append(v, t)
+		}
+	}
+	return strings.Join(v, ",")
+}
+
+// ShowView prints the definition of the view that name names, for \sv.
+// verbose numbers the lines.
+func (f *Formatter) ShowView(ctx context.Context, name string, verbose bool) error {
+	def, err := f.ViewDefinition(ctx, name)
+	if err != nil {
+		return err
+	}
+	for i, line := range strings.Split(f.colored(def), "\n") {
+		if verbose {
+			line = fmt.Sprintf("%-7d %s", i+1, line)
+		}
+		if _, err := fmt.Fprintln(f.out, line); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ViewDefinition returns the definition of the view that name names, as \sv
+// prints it and \ev edits it: a CREATE OR REPLACE VIEW statement with no
+// semicolon at its end, as psql writes it.
+func (f *Formatter) ViewDefinition(ctx context.Context, name string) (string, error) {
+	schema, n := f.meta.Dialect().Pattern(name)
+	views, err := all(ctx, f, dbmeta.Views, dbmeta.Args{Schema: schema, Name: n, WithSystem: true})
+	switch {
+	case err != nil:
+		return "", f.check(`\sv`, err)
+	case len(views) == 0:
+		return "", fmt.Errorf(text.RelationDoesNotExist, name)
+	case len(views) > 1:
+		return "", fmt.Errorf(text.MoreThanOneView, name)
+	}
+	v := views[0]
+	def := strings.TrimRight(null(v.Definition), " \t\r\n")
+	def = strings.TrimRight(strings.TrimSuffix(def, ";"), " \t\r\n")
+	// SQLite stores the whole statement, and the others the query
+	if _, ok := cutPrefixFold(strings.TrimSpace(def), "CREATE"); !ok {
+		def = "CREATE OR REPLACE VIEW " + qualify(v.Schema, v.Name) + " AS\n" + def
+	}
+	return def, nil
+}
+
+// partitionedType returns the type of a partitioned relation as psql names it,
+// such as "partitioned table", where the database says "table".
+func partitionedType(typ string) string {
+	t := strings.ToLower(typ)
+	if strings.HasPrefix(t, "partitioned") {
+		return t
+	}
+	return "partitioned " + t
+}
+
+// nullTF returns a boolean that may be absent the way psql prints one.
+func nullTF(b sql.Null[bool]) string {
+	if !b.Valid {
+		return ""
+	}
+	return tf(b.V)
+}
+
+// optionKey is the key of the options of one foreign object. A foreign table
+// is keyed by its schema and name, a user mapping by its server and role, and
+// the others by their name.
+func optionKey(o dbmeta.ForeignOption) string {
+	switch o.Kind {
+	case "foreign table":
+		return null(o.Schema) + "\x00" + null(o.Name)
+	case "user mapping":
+		return null(o.Server) + "\x00" + null(o.Name)
+	}
+	return null(o.Name)
+}
+
+// foreignOptions reads the options of each foreign object of a kind, keyed as
+// optionKey, and written as psql writes them: (host 'x', "user" 'u').
+func (f *Formatter) foreignOptions(ctx context.Context, kind string) (map[string]string, error) {
+	if !f.supports(dbmeta.ForeignOptions) {
+		return nil, nil
+	}
+	opts, err := optional(all(ctx, f, dbmeta.ForeignOptions, dbmeta.Args{WithSystem: true}))
+	if err != nil {
+		return nil, err
+	}
+	slices.SortStableFunc(opts, func(a, b dbmeta.ForeignOption) int { return int(a.Ordinal - b.Ordinal) })
+	parts := make(map[string][]string)
+	for _, o := range opts {
+		if o.Kind == kind {
+			parts[optionKey(o)] = append(parts[optionKey(o)], o.Quoted)
+		}
+	}
+	m := make(map[string]string, len(parts))
+	for k, v := range parts {
+		m[k] = "(" + strings.Join(v, ", ") + ")"
+	}
+	return m, nil
+}
+
+// withOptions returns the command that prints s with its FDW options column
+// read from the ForeignOptions kind, which keeps each option apart, in place
+// of the flat text of the object.
+func withOptions[T any](kind string, key func(T) string, s spec[T]) command {
+	return func(ctx context.Context, f *Formatter, c Call) error {
+		opts, err := f.foreignOptions(ctx, kind)
+		if err != nil {
+			return err
+		}
+		s := s
+		s.fields = slices.Clone(s.fields)
+		for i, fld := range s.fields {
+			if fld.name == "FDW options" && opts != nil {
+				s.fields[i].value = func(v T) any { return opts[key(v)] }
+			}
+		}
+		return list(s)(ctx, f, c)
+	}
+}
+
+// withElements returns the command that prints s with the elements of an
+// enumerated type one on each line, as psql prints them, where the type holds
+// them as one text.
+func withElements(s spec[dbmeta.Type]) command {
+	return func(ctx context.Context, f *Formatter, c Call) error {
+		var labels map[string][]string
+		if f.supports(dbmeta.EnumValues) {
+			vals, err := optional(all(ctx, f, dbmeta.EnumValues, dbmeta.Args{WithSystem: true}))
+			if err != nil {
+				return err
+			}
+			slices.SortStableFunc(vals, func(a, b dbmeta.EnumValue) int { return int(a.Ordinal - b.Ordinal) })
+			labels = make(map[string][]string)
+			for _, v := range vals {
+				labels[v.Schema+"\x00"+v.Enum] = append(labels[v.Schema+"\x00"+v.Enum], v.Label)
+			}
+		}
+		s := s
+		s.fields = slices.Clone(s.fields)
+		for i, fld := range s.fields {
+			if fld.name == "Elements" && labels != nil {
+				s.fields[i].value = func(t dbmeta.Type) any {
+					if l, ok := labels[t.Schema+"\x00"+t.Name]; ok {
+						return strings.Join(l, "\n")
+					}
+					return t.Elements
+				}
+			}
+		}
+		return list(s)(ctx, f, c)
+	}
+}

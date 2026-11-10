@@ -14,37 +14,66 @@ import (
 
 // Various usql text bits.
 var (
-	CommandName              = `usql`
-	CommandVersion           = `0.0.0-dev`
-	PassfileName             = CommandName + `pass`
-	ConfigName               = "config"
-	Banner                   = `the universal command-line interface for SQL databases`
-	CommandHelpHint          = `hint: try "` + CommandName + ` --help" for more information.`
-	GoInstallHint            = "\ntry:\n\n  go install -tags 'most %s' github.com/xo/usql@%s\n\n"
-	NotConnected             = `(not connected)`
-	HelpPrefix               = `help`
-	QuitPrefix               = `quit`
-	ExitPrefix               = `exit`
-	WelcomeDesc              = `Type "` + HelpPrefix + `" for help.`
-	QueryBufferEmpty         = `Query buffer is empty.`
-	QueryBufferReset         = `Query buffer reset (cleared).`
-	InvalidCommand           = `Invalid command \%s. Try \? for help.`
-	ExtraArgumentIgnored     = `\%s: extra argument %q ignored`
-	MissingRequiredArg       = `\%s: missing required argument`
-	Copyright                = CommandName + ", " + Banner + ".\n\n" + License
-	RowCount                 = `(%d rows)`
-	AvailableDrivers         = `Available Drivers:`
-	ConnInfo                 = `Connected with driver %s (%s)`
-	EnterPassword            = `Enter password: `
-	EnterPreviousPassword    = `Enter previous password: `
-	PasswordsDoNotMatch      = `Passwords do not match, trying again ...`
-	NewPassword              = `Enter new password: `
-	ConfirmPassword          = `Confirm password: `
-	PasswordChangeFailed     = `\password for %q failed: %v`
-	CouldNotSetVariable      = `could not set variable %q`
-	ChartParseFailed         = `\chart: invalid argument for %q: %v`
-	CommandIgnoredUseEndIf   = `%s command ignored; use \endif or %s to exit current \if block`
-	UnrecognizedValueForCond = `unrecognized value %q for "\%s expression": Boolean expected`
+	CommandName               = `usql`
+	CommandVersion            = `0.0.0-dev`
+	HistoryNotSaved           = `warning: the history is not saved: %v`
+	ConfigName                = "config"
+	ConfigInitMoved           = `the configuration file no longer runs a script: move it to %s`
+	ConfigUseFullName         = `%s names no section: use %s`
+	ConfigUnknownName         = `unknown configuration name: %s`
+	ConfigUnknownSection      = `unknown configuration section: %s`
+	ConfigNeedsName           = `%s is a section: name a setting in it, as %[1]s.NAME`
+	ConfigMoveTo              = `move it to %s`
+	ConfigNotSet              = `%s is not set`
+	DumpOptionNeedsValue      = `-%s needs a value: %s`
+	StylesTitle               = `Syntax highlighting styles:`
+	StylesCurrent             = "The style in use is %s.\nChange it with \\uset syntax_hl_style NAME, or \\config %s.syntax_hl_style NAME."
+	InvalidEnvName            = `invalid name of an environment variable: %q`
+	AliasRuns                 = `runs %s`
+	AliasIsACommand           = `\%s is a meta command of ` + CommandName + `, so an alias cannot take the name`
+	Banner                    = `the universal command-line interface for SQL databases`
+	CommandHelpHint           = `hint: try "` + CommandName + ` --help" for more information.`
+	GoInstallHint             = "\nthis build of usql leaves out the %s driver. try:\n\n  go install github.com/xo/usql@%s\n\n"
+	NotConnected              = `(not connected)`
+	HelpPrefix                = `help`
+	QuitPrefix                = `quit`
+	ExitPrefix                = `exit`
+	WelcomeDesc               = `Type "` + HelpPrefix + `" for help.`
+	QueryBufferEmpty          = `Query buffer is empty.`
+	QueryBufferReset          = `Query buffer reset (cleared).`
+	ConnectionReset           = `The connection to the server was lost. A new connection is open, and the settings of the session are gone.`
+	InvalidCommand            = `Invalid command \%s. Try \? for help.`
+	ExtraArgumentIgnored      = `\%s: extra argument %q ignored`
+	MissingRequiredArg        = `\%s: missing required argument`
+	Copyright                 = CommandName + ", " + Banner + ".\n\n" + License
+	RowCount                  = `(%d rows)`
+	AvailableDrivers          = `Available Drivers:`
+	ConnInfo                  = `Connected with driver %s (%s)`
+	ForwardInfo               = `Forwarded to %s`
+	ForwardLost               = `%w (\c starts it again)`
+	GdescNoColumns            = `The command has no result, or the result has no columns.`
+	WithArgumentTypes         = `with argument types`
+	NoPreviousError           = `There is no previous error.`
+	HistoryWritten            = `Wrote history to file "%s".`
+	HistoryInvalidCount       = `\%s: %q is not a count`
+	KubernetesTitle           = `List of Kubernetes databases in %s`
+	KubernetesNotFound        = `Did not find any Kubernetes databases in %s.`
+	KubernetesSkipped         = `note: skipped %s in %s: %s`
+	KubernetesAllForbidden    = `%w (\k without -A lists the current namespace)`
+	KubernetesMissingValue    = `\k: %s needs a value`
+	KubernetesAllAndNamespace = `\k: -A lists every namespace, and -n names %s`
+	KubernetesExtraArgument   = `\k: extra argument %q: the scope is %q`
+	EnterPassword             = `Enter password: `
+	EnterPreviousPassword     = `Enter previous password: `
+	PasswordsDoNotMatch       = `Passwords do not match, trying again ...`
+	NewPassword               = `Enter new password: `
+	ConfirmPassword           = `Confirm password: `
+	PasswordChangeFailed      = `\password for %q failed: %v`
+	CouldNotSetVariable       = `could not set variable %q`
+	ChartParseFailed          = `\chart: invalid argument for %q: %v`
+	CommandIgnoredUseEndIf    = `\%s command ignored; use \endif or Ctrl-C to exit current \if block`
+	QueryIgnoredUseEndIf      = `query ignored; use \endif or Ctrl-C to exit current \if block`
+	UnrecognizedValueForCond  = `unrecognized value %q for "\%s expression": Boolean expected`
 	// PasswordChangeSucceeded = `\password succeeded for %q`
 	HelpDesc          string
 	HelpDescShort     = `Use \? for help or press control-C to clear the input buffer.`
@@ -59,6 +88,11 @@ var (
 	}
 	QuitDesc                = `Use \q to quit.`
 	UnknownFormatFieldName  = `unknown option: %s`
+	UnknownSetting          = `unknown setting: %s`
+	SettingIs               = `%s is %s`
+	UnknownStyle            = `unknown style: %s`
+	UnknownFormatter        = `unknown format: %s (use one of %s)`
+	IsASetting              = `%s is a setting of %s, so it is not a variable: use \uset %s`
 	FormatFieldInvalid      = `unrecognized value %q for "%s"`
 	FormatFieldInvalidValue = `unrecognized value %q for "%s": %s expected`
 	FormatFieldNameSetMap   = map[string]string{
@@ -70,13 +104,15 @@ var (
 		`fieldsep_zero`:            `Field separator is zero byte.`,
 		`footer`:                   `Default footer is %s.`,
 		`format`:                   `Output format is %s.`,
+		`header_align`:             `Header alignment is %s.`,
+		`json_indent`:              `JSON indent is %d.`,
 		`linestyle`:                `Line style is %s.`,
 		`locale`:                   `Locale is %q.`,
 		`null`:                     `Null display is %q.`,
 		`numericlocale`:            `Locale-adjusted numeric output is %s.`,
 		`pager`:                    `Pager usage is %s.`,
 		`pager_min_lines`:          `Pager won't be used for less than %d line(s).`,
-		`recordsep`:                `Field separator is %q.`,
+		`recordsep`:                `Record separator is %q.`,
 		`recordsep_zero`:           `Record separator is zero byte.`,
 		`tableattr`:                `Table attributes are %q.`,
 		`time`:                     `Time display is %s.`,
@@ -85,6 +121,8 @@ var (
 		`unicode_border_linestyle`: `Unicode border line style is %q.`,
 		`unicode_column_linestyle`: `Unicode column line style is %q.`,
 		`unicode_header_linestyle`: `Unicode header line style is %q.`,
+		`xheader_width`:            `Expanded header width is %q.`,
+		`xheader_width_n`:          `Expanded header width is %d.`,
 	}
 	FormatFieldNameUnsetMap = map[string]string{
 		`tableattr`: `Table attributes unset.`,
@@ -95,11 +133,74 @@ var (
 	InvalidValue              = `invalid -%s value %q: %s`
 	NotSupportedByDriver      = `%s not supported by %s driver`
 	RelationNotFound          = `Did not find any relation named "%s".`
+	NoRelationsFound          = `Did not find any relations.`
+	NoneFound                 = `Did not find any %s.`
+	NoneFoundNamed            = `Did not find any %s named "%s".`
+	NoRoleSettingsFound       = `Did not find any settings for role "%s" and database "%s".`
+	NoRoleSettingsFoundRole   = `Did not find any settings for role "%s".`
+	NoRoleSettingsFoundAny    = `Did not find any settings.`
+	PublicationNotFound       = `Did not find any publication named "%s".`
+	NoPublicationsFound       = `Did not find any publications.`
+	ListOfRelations           = `List of relations`
+	ListOfFunctions           = `List of functions`
+	ListOfAggregates          = `List of aggregate functions`
+	ListOfDatabases           = `List of databases`
+	ListOfSchemas             = `List of schemas`
+	ColumnStats               = `Column stats`
+	AccessPrivileges          = `Access privileges`
+	ListOfTypes               = `List of data types`
+	ListOfDomains             = `List of domains`
+	ListOfOperators           = `List of operators`
+	ListOfCasts               = `List of casts`
+	ListOfLanguages           = `List of languages`
+	ListOfRoles               = `List of roles`
+	ListOfRoleSettings        = `List of settings`
+	ListOfRoleGrants          = `List of role grants`
+	DefaultAccessPrivileges   = `Default access privileges`
+	ListOfTablespaces         = `List of tablespaces`
+	ListOfAccessMethods       = `List of access methods`
+	ListOfCollations          = `List of collations`
+	ListOfConversions         = `List of conversions`
+	LargeObjects              = `Large objects`
+	ListOfSettings            = `List of configuration parameters`
+	ListOfNonDefaultSettings  = `List of non-default configuration parameters`
+	TSParser                  = `Text search parser "%s"`
+	TSParserTokenTypes        = `Token types for parser "%s"`
+	ObjectDescriptions        = `Object descriptions`
+	ListOfEventTriggers       = `List of event triggers`
+	ListOfExtendedStats       = `List of extended statistics`
+	ListOfForeignDataWrappers = `List of foreign-data wrappers`
+	ListOfForeignServers      = `List of foreign servers`
+	ListOfUserMappings        = `List of user mappings`
+	ListOfForeignTables       = `List of foreign tables`
+	ListOfPartitionedRels     = `List of partitioned relations`
+	ListOfPartitionedTables   = `List of partitioned tables`
+	ListOfPartitionedIndexes  = `List of partitioned indexes`
+	ListOfPublications        = `List of publications`
+	Publication               = `Publication %s`
+	ListOfSubscriptions       = `List of subscriptions`
+	ListOfTSConfigs           = `List of text search configurations`
+	ListOfTSParsers           = `List of text search parsers`
+	ListOfTSDictionaries      = `List of text search dictionaries`
+	ListOfTSTemplates         = `List of text search templates`
+	ListOfOperatorClasses     = `List of operator classes`
+	ListOfOperatorFamilies    = `List of operator families`
+	ListOfFamilyOperators     = `List of operators of operator families`
+	ListOfFamilyFunctions     = `List of support functions of operator families`
+	ListOfExtensions          = `List of installed extensions`
+	ObjectsInExtension        = `Objects in extension %s`
+	RelationDoesNotExist      = `relation "%s" does not exist`
+	MoreThanOneView           = `more than one view named "%s"`
+	NoChanges                 = `No changes`
+	FunctionNotFound          = `function "%s" does not exist`
+	MoreThanOneFunction       = `more than one function named "%s"`
+	FunctionHasNoDefinition   = `function "%s" has no definition`
+	TSConfig                  = `Text search configuration "%s"`
+	TSConfigParser            = `Parser: "%s"`
 	InvalidOption             = `invalid option %q`
 	NotificationReceived      = `Asynchronous notification %q %sreceived from server process with PID %d.`
 	NotificationPayload       = `with payload %q `
 	UnknownShortAlias         = `(unk)`
-	InvalidNamedConnection    = `warning: named connection %q was not defined: %v`
 	ChartsPathDoesNotExist    = `warning: charts_path %q does not exist`
 	ChartsPathIsNotADirectory = `warning: charts_path %q is not a directory`
 	UsageTemplate             = `Usage:

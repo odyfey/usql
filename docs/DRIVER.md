@@ -1,0 +1,429 @@
+# Adding a database driver to usql
+
+This document is written for a coding agent. It is the whole procedure, in
+order, including the parts that are not code.
+
+Read all of it before you start. Several steps happen in a different repository,
+and one of them must happen first.
+
+## The one thing to understand before anything else
+
+In usql, a broken driver and a working driver look the same at build time.
+
+Almost every field of `drivers.Driver` is optional. `drivers.Register` checks
+only that the name is not already taken. A driver that cannot parse its own
+connection string, or that panics on `\l`, compiles cleanly, registers cleanly,
+and passes `go test ./...`.
+
+So compilation is not evidence. Registration is not evidence. The only evidence
+is a live connection, and the verification step below says what to run.
+
+## Stop conditions
+
+Stop and report to the person who asked, rather than continuing, if any of
+these is true:
+
+1. The scheme does not exist in the version of `dburl` pinned in `go.mod`.
+2. The upstream driver fails any pre-flight check in the next section.
+3. The driver needs cgo, a vendored native library, or a client install.
+4. You cannot run the database locally, in a container or in an embedded mode.
+
+None of these means the driver must be refused. They mean the decision is not
+yours. Report what you found and wait.
+
+## Step 1. The pre-flight gate
+
+Answer five questions before you add the driver. Record the answers in the
+comment above its entry in `plainDrivers` in `gen.go`, or in its package
+comment, and in the commit message, so that a later reader can see what was
+checked and when.
+
+This gate exists because of what the history shows. Several drivers were added
+and later removed, and the cause was never the SQL. It was an upstream that
+stopped being maintained, or a driver that reached into global process state.
+
+### Is it maintained?
+
+Record the date of the last tagged release and the date of the last commit.
+Record whether open issues are being answered. Write dates, not impressions.
+
+A driver whose upstream stops being maintained is dropped from usql. See
+["When a driver is broken"](../CONTRIBUTING.md#when-a-driver-is-broken-and-what-to-do-about-it)
+in CONTRIBUTING.md.
+
+### Does it touch global process state?
+
+This is the question that pays. Read the upstream driver's `init()` and
+everything it calls. A driver may register itself with `database/sql` and do
+nothing else.
+
+Search the upstream source for these:
+
+    slog.SetDefault      log.SetOutput       log.SetFlags
+    log.SetPrefix        flag.Parse          os.Setenv
+    http.DefaultClient   http.DefaultTransport
+    signal.Notify        rand.Seed           os.Exit
+
+A hit inside package initialization is a stop condition.
+
+The RamSQL driver is why this check exists. Its `engine/log` package called
+`slog.SetDefault` from `init` with a handler writing to `os.Stdout`. A default
+`slog` logger also redirects the standard `log` package, so importing that one
+driver changed the output of the whole binary.
+
+### What does it link?
+
+Record whether the driver is pure Go. usql has one build, and every driver is
+in it. So a driver that needs cgo, ships a prebuilt native library, or requires
+a client install changes every build. It also costs far more binary size than
+a pure Go driver.
+
+A release build was 178.6 MiB, and DuckDB was 72.8 MiB of it (W32). Two
+known causes of a large binary survive `-s -w` stripping: `-rdynamic` in cgo
+LDFLAGS, and any use of Go's `plugin` package. Both force dynamic symbol
+export.
+
+### Can it be tested?
+
+Record whether a maintained container image exists, or whether the database
+runs embedded. A driver that nobody can run is a driver that nobody will
+notice breaking.
+
+Prefer an image the vendor publishes. An image last built years ago is not a
+maintained image.
+
+### Is the driver worth the wrapper it needs?
+
+If making the driver work needs a large validation wrapper, the answer is to
+not support it. The Dameng driver needed about 130 lines of DSN validation
+against a median of about 20 for other drivers, compensating for a parser that
+`dburl` cannot import or test. Dameng was later removed.
+
+Emit the connection string and let the driver reject what it rejects.
+
+## Step 2. The scheme, which lives in dburl
+
+usql does no connection string parsing. All of it is in
+[github.com/xo/dburl](https://github.com/xo/dburl). The scheme must exist there
+before usql can use it.
+
+Read `docs/SCHEME.md` in dburl. It is ten numbered steps written for this
+task. What follows is only the part that affects choices you make on the usql
+side.
+
+### The scheme and the build tag can differ
+
+usql's README table has a column headed `Scheme / Tag`. It holds the build
+tag, which is the `Tag` of the entry in `plainDrivers` or the directory name
+under `drivers/`, and not the scheme.
+
+They are allowed to differ and sometimes do. The lib/pq driver has the tag
+`libpq` and the scheme `pq`, and the firebird driver has the tag `firebird`
+and the scheme `firebirdsql`. It works, because the tag is also a dburl alias
+of the scheme.
+
+You are choosing two names. Do not assume they must match.
+
+### Choosing a generator
+
+A `Gen*` function is a helper. Reusing one says nothing about wire
+compatibility, and reuse is normal. Prefer the first of these that fits:
+
+1. `GenFromURL("scheme://localhost:PORT/")` when the connection string is a
+   URL that needs a default port.
+2. `GenScheme("name")` when it is a URL that needs no default port.
+3. A hand written `GenXxx` when the connection string is not a URL, such as a
+   `key=value` form, or when the generator has to reject something.
+
+What reuse does claim is that every driver behind that generator accepts the
+same connection string. Check that claim against the new driver. Trino and
+Presto shared a generator for six years, and it was split when the Presto v2
+driver started rejecting what the shared function produced.
+
+### File backed databases need a file type as well as a scheme
+
+A database that reads a file rather than connecting to a host needs a
+`RegisterFileType` call in dburl's `init`:
+
+    RegisterFileType("duckdb", isDuckdbHeader, `(?i)\.duckdb$`)
+
+The three arguments are the driver name, a header function, and an extension
+pattern. Register the scheme with `Opaque: true`.
+
+The header and the extension are consulted in different situations, and this
+is the part that costs debugging time:
+
+1. When the file exists, dburl reads the first 64 bytes and asks each header
+   function. The extension is never looked at.
+2. When the file does not exist, no header can be read, so the extension
+   decides.
+
+That is why `usql test.duckdb` once worked on a path that did not exist and
+failed on the same path after the file was created. Only the second case
+reached the faulty matcher. Anyone debugging that without knowing the rule
+looks at extension registration, where nothing is wrong.
+
+Header functions compare bytes at a fixed offset. They never use a regular
+expression.
+
+### Aliases are cheap to add and expensive to remove
+
+usql publishes every alias in its README table, so an alias is advertised as
+supported from the moment it exists. Removing one is a change to the front
+page.
+
+Presto is the warning. Five aliases were published. Two of them were `s`
+suffixed variants meaning TLS, which the v2 driver cannot express, because it
+selects TLS from options rather than from the scheme. Removing them was a
+break.
+
+Do not add an alias for a spelling you have not seen in use.
+
+### Read the parser, not the documentation
+
+Read the connection string parser in the exact driver version that usql pins
+in `go.mod`. Not the driver's documentation, and not memory. Presto broke
+because nobody did.
+
+## Step 3. The driver
+
+usql has one build, and every driver is in it. A plain `go build` links the
+new driver, `no_<tag>` leaves it out, and `no_drivers` leaves it out unless the
+build names its tag. There are no build groups to choose from.
+
+### A driver with no hooks has no package
+
+Most drivers need no hook, because nearly every field of `drivers.Driver` is
+optional. Such a driver gets no package under `drivers`. Add an entry for its
+build tag to `plainDrivers` in `gen.go`, in the order of the tags:
+
+    // pure Go, over HTTP. The pre-flight answers of Step 1 go here.
+    {Tag: "mydb"},
+
+`gen.go` reads the rest from the dburl scheme of the tag: the package to
+import, the name to register, the description and the URL of the README row.
+It writes `internal/mydb.go`, which imports the package, with the comment
+`// DRIVER`, and calls `drivers.Register("mydb", drivers.Driver{})`. Other
+tools in the family find a driver by searching for that comment.
+
+A driver of [dbimp](https://github.com/xo/dbimp) is exactly this, and nothing
+more. dbimp's errors print as they are, an error whose
+`AuthenticationRefused` method returns true, as `dbimp.ErrAuthentication`
+does, is a wrong password, a statement with no count of rows changed is a
+count of zero, and `\copy` takes each insert alone when `BeginTx` fails with
+`dbimp.ErrNotSupported`. Set a hook only for a fact that none of these
+cover, and put a fact about the database in dbmeta and a default of the DSN in
+dburl.
+
+A field that describes the database rather than the Go driver is not set in
+usql. dbmeta holds it, keyed by the dialect: the comment and quoting forms
+the lexer allows, what happens to a trailing semicolon, the statements that
+open and close a batch, whether a password change needs the old password, and
+how the database folds the case of a name. D5 records this. A database with
+no dbmeta model gets only block comments. W28 holds the four drivers whose
+statement handling waits for dbmeta.
+
+A driver that cannot compile everywhere gives a constraint in the `Build`
+field, and `gen.go` adds it to the generated file under `internal`. DuckDB
+uses it, because its prebuilt library has no 32 bit arm build:
+
+    {Tag: "duckdb", Build: "!(linux && arm)"},
+
+### A driver with a hook has a package
+
+A driver that needs a hook, such as `Err`, `Version` or `Open`, gets a package
+`drivers/<tag>/<tag>.go` instead, with an `init()` that calls
+`drivers.Register`. Do not give it an entry in `plainDrivers` as well. `gen.go`
+stops with an error when a tag has both.
+
+    // Package mydb defines and registers usql's MyDB driver.
+    //
+    // See: https://github.com/example/mydb-go-driver
+    package mydb
+
+    import (
+        "github.com/example/mydb-go-driver" // DRIVER
+        "github.com/xo/usql/drivers"
+    )
+
+    func init() {
+        drivers.Register("mydb", drivers.Driver{
+            Err: func(err error) (string, string) { ... },
+        })
+    }
+
+Keep the `// DRIVER` comment on the driver import. The `See:` line must be the
+URL that dburl records for the scheme, and `TestDriverSeeMatchesDburl` checks
+it.
+
+`gen.go` reads two other lines of the package comment. A `Build:` line gives a
+constraint, as the `Build` field of `plainDrivers` does:
+
+    // Build: !(linux && arm)
+
+A `Tags:` line names further build tags that select the driver. Each one
+selects it as the driver's own tag does, and its `no_` form leaves the driver
+out. The pgx driver answers to the `postgres` tag this way, because dburl sends
+`postgres://` URLs to it:
+
+    // Tags: postgres
+
+A tag that is also the name of a dburl scheme folds that scheme into the
+driver. The driver registers under the scheme as well, and `gen.go` lists the
+scheme and its aliases in the README row of the driver. When the scheme is the
+dialect of the driver, the row takes the name of the database from it. That is
+why pgx has one row, named PostgreSQL.
+
+Most drivers have no `Tags:` line. A `Build:` line cannot do this job, because
+`gen.go` combines it with the constraint of the tags using `&&`, so it can only
+narrow where a driver builds.
+
+### A driver built on another driver
+
+A driver for a database that speaks the protocol of another, as TiDB speaks
+the MySQL protocol, imports the driver package of that database and registers
+its driver under its own scheme. `gen.go` reads the import, and the generated
+constraint leaves the driver out when the other one is left out. `no_mysql`
+leaves out memsql, tidb and vitess this way.
+
+A database that speaks the PostgreSQL protocol imports `drivers/pgwire`
+instead. pgwire gives pgx when the build has pgx, and libpq when it does not,
+so `no_pgx` leaves pgx out and these drivers keep working.
+
+### The order of the rows
+
+`firstOrder` in `gen.go` names the drivers that come first in the README
+table, in order. The other drivers follow in the order of their descriptions.
+A new driver needs no edit there.
+
+## Step 4. Generate, do not edit
+
+Run the generator:
+
+    go run gen.go
+
+It reads dburl's scheme registry from the version pinned in `go.mod`. So the
+scheme from Step 2 reaches usql only after `go.mod` moves to the dburl release
+that holds it.
+
+These files are generated. Do not edit them by hand:
+
+1. `internal/<tag>.go`, which carries the build constraints, and for a driver
+   in `plainDrivers` the import and the registration.
+2. The driver tables in `README.md`.
+3. The blocks of `README.md` that have an `<!-- EXAMPLE name -->` marker.
+4. The bundled license files.
+
+The description, the package, the link, the aliases and the markers of a
+README row come from dburl's registry. Only the `Scheme / Tag` column comes
+from usql, as the build tag. So a change to any other part of a row is made in
+dburl.
+
+Then add the module and tidy:
+
+    go get github.com/example/mydb-go-driver@latest
+    go mod tidy
+
+## Step 5. Metadata goes to dbmeta
+
+Do not write a metadata reader here. usql reads all database metadata from
+[dbmeta](https://github.com/xo/dbmeta), and `metacmd/describe` holds no reader
+of its own. See D3 and D4.
+
+usql reads the metadata of every driver from dbmeta, by the
+dialect that dburl sets. A driver whose database dbmeta has no model for
+reports that its describe commands, such as `\d`, `\dt`, `\l` and `\dp`, are
+not supported. Add it to `noModel` in `metadata_test.go` with the reason,
+because `TestEveryDriverReadsThroughDbmeta` fails until it is there.
+
+The metadata for a new database is added in `dbmeta`, which models each
+product and says what it can answer. Ask in dbmeta, or ask a maintainer. W21
+in [BACKLOG.md](BACKLOG.md) holds the migration.
+
+## Step 6. Verification
+
+Compilation proves nothing here. Run all of this, and report the output rather
+than a summary of it.
+
+### Without a database
+
+    go run gen.go                       # then inspect git diff
+    go build ./...                      # every driver
+    go build -tags 'no_drivers mydb' .  # the new driver alone
+    go vet ./...
+    go test ./...
+
+`go test ./...` matters on its own, because it starts usql with every driver,
+and a duplicate scheme or alias panics at registration time rather than at
+compile time. The build with `no_drivers` finds a driver that compiles only
+beside another.
+
+Every test must pass. No test of usql starts a database. A test that needs
+one skips when `USQL_TEST_URL` is not set.
+
+### With a database
+
+Start the database with dbmeta's `dbrun`, as "Command line tests" in
+[CONTRIBUTING.md](../CONTRIBUTING.md#command-line-tests) says. Then run each
+of these and keep the output:
+
+    usql <dsn> -c 'select 1'
+    usql <dsn> -c '\dt'
+
+If dbmeta has no model for the database, the second one reports that
+describe commands are not supported. See Step 5.
+
+Try every connection string form that dburl accepts for the scheme, including
+the short alias. Try one malformed connection string, and make sure that it
+produces an error rather than a panic.
+
+For a file backed driver, test both cases separately, because they take
+different paths through dburl:
+
+    usql ./new.db        # the file does not exist: the extension decides
+    usql ./existing.db   # the file exists: the header decides
+
+### What counts as done
+
+Do not report the work as complete on compilation, on registration, or on
+`go test` alone. In this repository all three are true of a driver that does
+not work.
+
+Report the pre-flight answers, the generator diff, and the transcript of a
+live connection.
+
+## What goes wrong most often
+
+Adding the driver to usql without the scheme existing in dburl. The code
+compiles, connecting fails at runtime, and the next move is usually to write
+connection string parsing inside the usql driver package. That parsing does not
+belong there and will be rejected. If the scheme is missing, stop at Step 2.
+
+The second most common is hand editing a generated file. The change survives
+until somebody runs `go run gen.go`, and then it disappears.
+
+## The checks that tell you what you forgot
+
+| Check | What fails it |
+| --- | --- |
+| `go test ./...` | A duplicate scheme or alias, which panics at registration |
+| `go build -tags 'no_drivers <tag>' .` | A driver that compiles only beside another |
+| `git diff` after `go run gen.go` | A generated file that was edited by hand |
+| A malformed connection string | A panic where an error was wanted |
+| A file path that does not exist | A missing extension pattern in dburl |
+| A file path that does exist | A faulty header function in dburl |
+| The upstream `init()` | A driver that writes global process state |
+
+Add a row whenever you find something this document did not catch. The table
+is read when something is red, which is more often than the rest of the
+document is read.
+
+## Related documents
+
+| Task | Document |
+| --- | --- |
+| Adding a scheme | `docs/SCHEME.md` in dburl |
+| A driver that is broken or unmaintained | [CONTRIBUTING.md](../CONTRIBUTING.md) |
+| Running the tests | [CONTRIBUTING.md](../CONTRIBUTING.md) |
+| Planned work | [BACKLOG.md](BACKLOG.md) |
+| Rules for agents working here | [AGENTS.md](../AGENTS.md) |

@@ -5,41 +5,46 @@
 package moderncsqlite
 
 import (
-	"context"
-	"database/sql"
-	"io"
+	"errors"
+	"regexp"
 	"strconv"
 
-	"github.com/xo/dburl"
 	"github.com/xo/usql/drivers"
-	"github.com/xo/usql/drivers/sqlite3/sqshared"
+	"github.com/xo/usql/drivers/sqwire/sqshared"
 	"modernc.org/sqlite" // DRIVER
 )
 
+// errorRE splits the text of an error of modernc.org/sqlite.
+var errorRE = regexp.MustCompile(`^[^:]+: (.*) \(\d+\)$`)
+
 func init() {
 	drivers.Register("moderncsqlite", drivers.Driver{
-		AllowMultilineComments: true,
-		Open: func(_ context.Context, u *dburl.URL, stdout, stderr func() io.Writer) (func(string, string) (*sql.DB, error), error) {
-			return func(_ string, params string) (*sql.DB, error) {
-				return sql.Open("sqlite", params)
-			}, nil
-		},
-		Version: func(ctx context.Context, db drivers.DB) (string, error) {
-			var ver string
-			err := db.QueryRowContext(ctx, `SELECT sqlite_version()`).Scan(&ver)
-			if err != nil {
-				return "", err
-			}
-			return "ModernC SQLite " + ver, nil
-		},
+		// modernc words an error as "SQL logic error: message (1)", where
+		// go-sqlite3 says "message", so the code and the name of the code are
+		// taken off the text, and the two drivers print the same
 		Err: func(err error) (string, string) {
 			if e, ok := err.(*sqlite.Error); ok {
-				return strconv.Itoa(e.Code()), e.Error()
+				msg := e.Error()
+				if m := errorRE.FindStringSubmatch(msg); m != nil {
+					msg = m[1]
+				}
+				return strconv.Itoa(e.Code()), msg
 			}
 			return "", err.Error()
 		},
-		ConvertBytes:      sqshared.ConvertBytes,
-		NewMetadataReader: sqshared.NewMetadataReader,
-		Copy:              drivers.CopyWithInsert(func(int) string { return "?" }),
+		// psql's layout, with the extended result code as the code, and its
+		// name in DETAIL
+		ErrVerbose: func(err error, _ string) string {
+			var e *sqlite.Error
+			if !errors.As(err, &e) {
+				return ""
+			}
+			msg := e.Error()
+			if m := errorRE.FindStringSubmatch(msg); m != nil {
+				msg = m[1]
+			}
+			return drivers.Verbose(strconv.Itoa(e.Code()), msg, [2]string{"DETAIL", sqlite.ErrorCodeString[e.Code()]})
+		},
+		ConvertBytes: sqshared.ConvertBytes,
 	})
 }

@@ -7,40 +7,61 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"maps"
 	"os/user"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/mattn/go-runewidth"
+	"github.com/xo/dbfwd"
 	"github.com/xo/dburl"
+	"github.com/xo/rline"
 	"github.com/xo/usql/drivers"
-	"github.com/xo/usql/drivers/metadata"
+	"github.com/xo/usql/dump"
 	"github.com/xo/usql/env"
-	"github.com/xo/usql/rline"
-	"github.com/xo/usql/stmt"
+	"github.com/xo/usql/feed"
+	"github.com/xo/usql/metacmd/describe"
 	"github.com/xo/usql/text"
 )
 
 // Handler is the shared interface for a command handler.
 type Handler interface {
-	// IO handles the handler's IO.
-	IO() rline.IO
+	// IO returns the session of the line editor.
+	IO() *rline.Prompt
+	// Stdout returns where a command writes its output. The output goes to
+	// the pager when it does not fit on the terminal.
+	Stdout() io.Writer
 	// User returns the current user.
 	User() *user.User
 	// URL returns the current database URL.
 	URL() *dburl.URL
+	// Forward returns the URL that the forward of the connection resolved,
+	// and the forward, or nil and nil.
+	Forward() (*dburl.URL, *dbfwd.Forward)
 	// DB returns the current database connection.
 	DB() drivers.DB
 	// LastExec returns the last executed query.
 	LastExec() string
-	// LastPrint returns the last executed printable query.
-	LastPrint() string
 	// LastRaw returns the last raw (non-interpolated) query.
 	LastRaw() string
-	// Buf returns the current query buffer.
-	Buf() *stmt.Stmt
-	// Reset resets the last and current query buffer.
-	Reset([]rune)
+	// LastError returns the error of the last statement that failed, and
+	// the statement, or nil when none failed.
+	LastError() (error, string)
+	// Restrict enters restricted mode, in which no meta command runs but
+	// \unrestrict with the same key.
+	Restrict(string) error
+	// Unrestrict leaves restricted mode when the key matches.
+	Unrestrict(string) error
+	// Buffer returns the query buffer.
+	Buffer() *feed.Buffer
+	// Lookup returns the value of a variable, for expanding the buffer.
+	Lookup(string) (string, bool)
+	// Reset empties the query buffer and forgets the last query.
+	Reset()
+	// Push puts text in front of the input, as \e does with the edited query.
+	Push(string)
 	// Bind binds query parameters.
 	Bind([]interface{})
 	// Open opens a database connection.
@@ -53,14 +74,23 @@ type Handler interface {
 	ReadVar(string, string) (string, error)
 	// Include includes a file.
 	Include(string, bool) error
+	// If starts a conditional block. The handler calls the function for the
+	// value of the expression only when the block starts in a branch that
+	// runs.
+	If(func() (bool, error)) error
+	// ElseIf starts the next branch of the conditional block. The handler
+	// calls the function only when no branch of the block ran yet.
+	ElseIf(func() (bool, error)) error
+	// Else starts the last branch of the conditional block.
+	Else() error
+	// EndIf ends the conditional block.
+	EndIf() error
 	// Begin begins a transaction.
 	Begin(*sql.TxOptions) error
 	// Commit commits the current transaction.
 	Commit() error
 	// Rollback aborts the current transaction.
 	Rollback() error
-	// Highlight highlights the statement.
-	Highlight(io.Writer, string) error
 	// GetTiming mode.
 	GetTiming() bool
 	// SetTiming mode.
@@ -69,10 +99,22 @@ type Handler interface {
 	GetOutput() io.Writer
 	// SetOutput writer.
 	SetOutput(io.WriteCloser)
-	// MetadataWriter retrieves the metadata writer for the handler.
-	MetadataWriter(context.Context) (metadata.Writer, error)
+	// Formatter returns the formatter of the describe commands.
+	Formatter(context.Context) (*describe.Formatter, error)
 	// Print formats according to a format specifier and writes to handler's standard output.
 	Print(string, ...interface{})
+	// Dump writes the database of the connection as a script.
+	Dump(context.Context, io.Writer, dump.Options) error
+	// Highlight returns SQL in color for the terminal, when the input is
+	// highlighted and the output goes to the terminal, and as it is
+	// otherwise.
+	Highlight(string) string
+}
+
+// notes are the lines that follow the name of a section in the help, as in
+// psql.
+var notes = map[string]string{
+	"Informational": "(options: S = show system objects, x = expanded mode, + = additional detail)",
 }
 
 // Dump writes the command descriptions to w, separated by section.
@@ -90,69 +132,243 @@ func Dump(w io.Writer, hidden bool) error {
 			fmt.Fprintln(w)
 		}
 		fmt.Fprintln(w, s)
+		if note, ok := notes[s]; ok {
+			fmt.Fprintln(w, "  "+note)
+		}
 		for _, desc := range descs[i] {
 			if (!desc.Hidden && !desc.Deprecated) || hidden {
 				_, _ = fmt.Fprintf(w, "  \\%- *s  %s\n", n, desc.Name+" "+desc.Params, wrap(desc.Desc, 95, n+5))
 			}
 		}
 	}
+	// the aliases of the configuration file follow, with the text that
+	// each one runs
+	if names := env.Vars().AliasNames(); hidden && len(names) != 0 {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "Aliases")
+		for _, name := range names {
+			body, _ := env.Vars().Alias(name)
+			_, _ = fmt.Fprintf(w, "  \\%- *s  %s\n", n, name, wrap(fmt.Sprintf(text.AliasRuns, env.Quote(body)), 95, n+5))
+		}
+	}
 	return nil
 }
 
-// Decode converts a command name (or alias) into a Runner.
-func Decode(name string, params *stmt.Params) (func(Handler) (Option, error), error) {
+// Decode returns the function that runs the meta command it. The function
+// returns the options of the command, and each argument that the command did
+// not read.
+func Decode(it feed.Item) (func(Handler) (Option, []string, error), error) {
+	name := it.Name
+	registered := name
 	f, ok := cmds[name]
+	if !ok {
+		registered = relations(name)
+		f, ok = cmds[registered]
+	}
 	if !ok || name == "" {
 		return nil, text.ErrUnknownCommand
 	}
-	return func(h Handler) (Option, error) {
+	return func(h Handler) (Option, []string, error) {
 		p := &Params{
 			Handler: h,
 			Name:    name,
-			Params:  params,
+			mods:    modifiers(registered),
+			item:    it,
 		}
 		err := f(p)
-		return p.Option, err
+		return p.Option, p.Unread(), err
 	}, nil
 }
 
-// Params wraps metacmd parameters.
+// Styles writes the names of the syntax highlighting styles to w, in columns
+// that read down, as ls lists files, and then the style in use.
+func Styles(w io.Writer, names []string, current string) error {
+	width := 0
+	for _, name := range names {
+		width = max(width, runewidth.StringWidth(name))
+	}
+	width += 2
+	cols := max(1, (95-2)/width)
+	rows := (len(names) + cols - 1) / cols
+	if _, err := fmt.Fprintln(w, text.StylesTitle); err != nil {
+		return err
+	}
+	for r := range rows {
+		var b strings.Builder
+		b.WriteString("  ")
+		for c := range cols {
+			i := c*rows + r
+			if i >= len(names) {
+				break
+			}
+			b.WriteString(names[i])
+			if c != cols-1 && i+rows < len(names) {
+				b.WriteString(strings.Repeat(" ", width-runewidth.StringWidth(names[i])))
+			}
+		}
+		if _, err := fmt.Fprintln(w, b.String()); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprintf(w, "\n"+text.StylesCurrent+"\n", current, text.CommandName)
+	return err
+}
+
+// Has reports whether a meta command has the name, as Decode finds it.
+func Has(name string) bool {
+	_, ok := cmds[name]
+	if !ok {
+		_, ok = cmds[relations(name)]
+	}
+	return ok
+}
+
+// relations returns name with the class letters of \d in the order that
+// they are registered in, so that \dvt finds \dtv, as psql allows.
+func relations(name string) string {
+	base := strings.TrimRight(name, modifierLetters)
+	if len(base) < 2 || base[0] != 'd' || strings.Trim(base[1:], "tvmsEi") != "" {
+		return name
+	}
+	var b strings.Builder
+	b.WriteByte('d')
+	for _, c := range "tvmsEi" {
+		if strings.ContainsRune(base[1:], c) {
+			b.WriteRune(c)
+		}
+	}
+	return b.String() + name[len(base):]
+}
+
+// Params are the name and the arguments of one meta command, as the usql
+// grammar parsed them. A command reads its arguments in order, and the
+// handler reports the ones that it did not read.
 type Params struct {
 	// Handler is the process handler.
 	Handler Handler
 	// Name is the name of the metacmd.
 	Name string
-	// Params are the actual statement parameters.
-	Params *stmt.Params
 	// Option contains resulting command execution options.
 	Option Option
+
+	// mods are the letters of Name that are modifiers, such as S, x and +.
+	mods string
+	// item is the meta command.
+	item feed.Item
+	// next is the index of the next argument to read.
+	next int
+	// options is set once the option list of \g has been read.
+	options bool
 }
 
-// Next returns the next command parameter, using env.Untick.
-func (p *Params) Next(exec bool) (string, error) {
-	v, _, err := p.Params.Next(env.Untick(
-		p.Handler.User(),
-		env.Vars(),
-		exec,
-	))
-	if err != nil {
-		return "", err
+// Base returns the name of the command without its modifiers, such as dt for
+// \dtS+ and dx for \dxx.
+func (p *Params) Base() string {
+	return p.Name[:len(p.Name)-len(p.mods)]
+}
+
+// Modifier reports whether the command was given the modifier c, such as S,
+// x or +.
+func (p *Params) Modifier(c rune) bool {
+	return strings.ContainsRune(p.mods, c)
+}
+
+// arg returns the next argument that is not an option list, and moves past
+// it. It returns false when no argument is left.
+func (p *Params) arg() (feed.Arg, bool) {
+	for p.next < len(p.item.Args) {
+		a := p.item.Args[p.next]
+		p.next++
+		if a.Parts[0].Kind != feed.Options {
+			return a, true
+		}
 	}
-	return v, nil
+	return feed.Arg{}, false
 }
 
-// NextOK returns the next command parameter, using env.Untick.
+// value returns the value of an argument.
+//
+// A string and a quoted name lose their quotes, and a variable is replaced by
+// its value: :'name' as a quoted string and :"name" as a quoted name, as in
+// psql. A shell command between backticks runs when exec is set. A quoted
+// name keeps its quotes when pattern is set, so that a psql pattern can tell
+// it from a name that the database folds.
+func (p *Params) value(a feed.Arg, exec, pattern bool) (string, error) {
+	var b strings.Builder
+	for _, part := range a.Parts {
+		raw := p.item.Text[part.Start:part.End]
+		switch part.Kind {
+		case feed.String:
+			s, err := env.Unquote(raw)
+			if err != nil {
+				return "", err
+			}
+			b.WriteString(s)
+		case feed.QuotedIdentifier:
+			if pattern {
+				b.WriteString(raw)
+				continue
+			}
+			s, err := env.Unquote(raw)
+			if err != nil {
+				return "", err
+			}
+			b.WriteString(s)
+		case feed.Variable:
+			v, ok := env.Vars().Get(part.Name)
+			switch {
+			case part.Quote == '?' && ok:
+				b.WriteString("TRUE")
+			case part.Quote == '?':
+				b.WriteString("FALSE")
+			case !ok:
+				b.WriteString(raw)
+			case part.Quote == '\'' || part.Quote == '"':
+				q := string(part.Quote)
+				b.WriteString(q + strings.ReplaceAll(v, q, q+q) + q)
+			default:
+				b.WriteString(v)
+			}
+		case feed.Backtick:
+			if !exec {
+				b.WriteString(raw)
+				continue
+			}
+			out, err := env.Exec(expandShell(part.Value))
+			if err != nil {
+				return "", err
+			}
+			b.WriteString(out)
+		case feed.Pipe:
+			b.WriteString("|" + part.Value)
+		case feed.Shell:
+			b.WriteString(part.Value)
+		default:
+			b.WriteString(raw)
+		}
+	}
+	return b.String(), nil
+}
+
+// Next returns the value of the next argument, or an empty string when none
+// is left. A shell command between backticks runs when exec is set.
+func (p *Params) Next(exec bool) (string, error) {
+	v, _, err := p.NextOK(exec)
+	return v, err
+}
+
+// NextOK returns the value of the next argument, and false when none is left.
 func (p *Params) NextOK(exec bool) (string, bool, error) {
-	return p.Params.Next(env.Untick(
-		p.Handler.User(),
-		env.Vars(),
-		exec,
-	))
+	a, ok := p.arg()
+	if !ok {
+		return "", false, nil
+	}
+	v, err := p.value(a, exec, false)
+	return v, err == nil, err
 }
 
-// NextOpt returns the next command parameter, using env.Untick. Returns true
-// when the value is prefixed with a "-", along with the value sans the "-"
-// prefix. Otherwise returns false and the value.
+// NextOpt returns the value of the next argument. It returns true when the
+// value starts with a "-", along with the value without the "-".
 func (p *Params) NextOpt(exec bool) (string, bool, error) {
 	v, err := p.Next(exec)
 	switch {
@@ -164,21 +380,116 @@ func (p *Params) NextOpt(exec bool) (string, bool, error) {
 	return v, false, nil
 }
 
-// All gets all remaining command parameters using env.Untick.
-func (p *Params) All(exec bool) ([]string, error) {
-	return p.Params.All(env.Untick(
-		p.Handler.User(),
-		env.Vars(),
-		exec,
-	))
+// RawOpt reads the option -raw, which \e, \p and \w take before their other
+// arguments, and returns true when it is there. It leaves any other argument
+// unread, and fails on any other option.
+func (p *Params) RawOpt() (bool, error) {
+	opts, err := p.flags("raw")
+	return opts["raw"], err
 }
 
-// Raw returns the remaining command parameters as a raw string.
-//
-// Note: no other processing is done to interpolate variables or to decode
-// string values.
+// flags reads the options that come before the other arguments, such as -all,
+// and returns the ones that were given. It leaves the first argument that is
+// not an option unread, and fails on an option that is not one of names.
+func (p *Params) flags(names ...string) (map[string]bool, error) {
+	opts := make(map[string]bool)
+	for {
+		next := p.next
+		a, ok := p.arg()
+		if !ok {
+			return opts, nil
+		}
+		v, err := p.value(a, false, false)
+		switch {
+		case err != nil:
+			return nil, err
+		case len(v) > 1 && v[0] == '-' && slices.Contains(names, v[1:]):
+			opts[v[1:]] = true
+			continue
+		case len(v) > 1 && v[0] == '-':
+			return nil, fmt.Errorf(text.InvalidOption, v[1:])
+		}
+		p.next = next
+		return opts, nil
+	}
+}
+
+// All returns the values of the arguments that are left.
+func (p *Params) All(exec bool) ([]string, error) {
+	var v []string
+	for {
+		s, ok, err := p.NextOK(exec)
+		switch {
+		case err != nil:
+			return nil, err
+		case !ok:
+			return v, nil
+		}
+		v = append(v, s)
+	}
+}
+
+// NextPattern returns the value of the next argument as a psql pattern, in
+// which a quoted name keeps its quotes.
+func (p *Params) NextPattern() (string, error) {
+	a, ok := p.arg()
+	if !ok {
+		return "", nil
+	}
+	return p.value(a, true, true)
+}
+
+// Patterns returns the values of the arguments that are left, as psql
+// patterns. See NextPattern.
+func (p *Params) Patterns() ([]string, error) {
+	var v []string
+	for {
+		a, ok := p.arg()
+		if !ok {
+			return v, nil
+		}
+		s, err := p.value(a, true, true)
+		if err != nil {
+			return nil, err
+		}
+		v = append(v, s)
+	}
+}
+
+// Raw returns the shell command of \!, as it is written.
 func (p *Params) Raw() string {
-	return p.Params.Raw()
+	a, ok := p.arg()
+	if !ok {
+		return ""
+	}
+	s, _ := p.value(a, false, false)
+	return s
+}
+
+// Options returns the keys and values of the option list of \g and its forms,
+// such as (format=csv), in order.
+func (p *Params) Options() []feed.Option {
+	p.options = true
+	for _, a := range p.item.Args {
+		if a.Parts[0].Kind == feed.Options {
+			return a.Parts[0].Options
+		}
+	}
+	return nil
+}
+
+// Unread returns each argument that the command did not read, as it is
+// written, so that the handler can report it as ignored.
+func (p *Params) Unread() []string {
+	var v []string
+	for _, a := range p.item.Args[p.next:] {
+		if a.Parts[0].Kind == feed.Options && p.options {
+			continue
+		}
+		first, last := a.Parts[0], a.Parts[len(a.Parts)-1]
+		v = append(v, p.item.Text[first.Start:last.End])
+	}
+	return v
 }
 
 // Option contains parsed result options of a metacmd.
@@ -193,35 +504,6 @@ type Option struct {
 	Crosstab []string
 	// Watch is the watch duration interval.
 	Watch time.Duration
-}
-
-func (opt *Option) ParseParams(params []string, defaultKey string) error {
-	if opt.Params == nil {
-		opt.Params = make(map[string]string, len(params))
-	}
-	formatOpts := false
-	for i, param := range params {
-		if len(param) == 0 {
-			continue
-		}
-		if !formatOpts {
-			if param[0] == '(' {
-				formatOpts = true
-			} else {
-				opt.Params[defaultKey] = strings.Join(params[i:], " ")
-				return nil
-			}
-		}
-		parts := strings.SplitN(param, "=", 2)
-		if len(parts) == 1 {
-			return text.ErrInvalidFormatOption
-		}
-		opt.Params[strings.TrimLeft(parts[0], "(")] = strings.TrimRight(parts[1], ")")
-		if formatOpts && param[len(param)-1] == ')' {
-			formatOpts = false
-		}
-	}
-	return nil
 }
 
 // ExecType represents the type of execution requested.
@@ -239,6 +521,9 @@ const (
 	ExecSet
 	// ExecExec indicates execution and executing the resulting rows (\gexec).
 	ExecExec
+	// ExecDescribe indicates describing the result without executing the
+	// query (\gdesc).
+	ExecDescribe
 	// ExecCrosstab indicates execution using crosstabview (\crosstabview).
 	ExecCrosstab
 	// ExecChart indicates execution using chart (\chart).
@@ -257,21 +542,132 @@ type desc struct {
 	Deprecated bool
 }
 
-// Names returns the names for the command.
+// Names returns the names for the command. Each group of letters between
+// brackets adds every combination of its letters, in their order, so d[S+]
+// is d, dS, d+ and dS+, and df[an][S+] adds dfa, dfan, dfaS+ and the rest.
 func (d desc) Names() []string {
-	switch i := strings.Index(d.Name, "["); {
-	case i == -1:
-		return []string{d.Name}
-	case !strings.HasSuffix(d.Name, "]"):
-		panic(fmt.Sprintf("invalid command %q", d.Name))
-	default:
-		name := d.Name[:i]
-		v := []string{name}
-		for _, s := range d.Name[i+1 : len(d.Name)-1] {
-			v = append(v, name+string(s))
-		}
-		return v
+	var names []string
+	for _, n := range d.names() {
+		names = append(names, n.name)
 	}
+	return names
+}
+
+// modifierLetters are the letters of a group between brackets that is a group
+// of modifiers: S for the objects of the system, x for expanded output, and +
+// for more columns.
+const modifierLetters = "Sx+"
+
+// name is one name of a command, and the letters of it that are modifiers.
+type name struct {
+	name string
+	mods string
+}
+
+// names returns the names for the command, as Names does, each with the
+// letters that came from a group of modifiers. A group is one of modifiers
+// when each of its letters is in modifierLetters, as [Sx+] is and [an] is not.
+func (d desc) names() []name {
+	i := strings.Index(d.Name, "[")
+	if i == -1 {
+		return []name{{name: d.Name}}
+	}
+	names := []name{{name: d.Name[:i]}}
+	for s := d.Name[i:]; s != ""; {
+		j := strings.Index(s, "]")
+		if s[0] != '[' || j == -1 {
+			panic(fmt.Sprintf("invalid command %q", d.Name))
+		}
+		group := s[1:j]
+		mod := strings.Trim(group, modifierLetters) == ""
+		for _, c := range group {
+			for _, n := range names {
+				m := n.mods
+				if mod {
+					m += string(c)
+				}
+				names = append(names, name{name: n.name + string(c), mods: m})
+			}
+		}
+		s = s[j+1:]
+	}
+	return names
+}
+
+// modifiers returns the letters of name that are modifiers, by the command
+// that registers name. A later command wins, as it does in cmds, so \dx is
+// the extensions and not \d with x.
+func modifiers(cmd string) string {
+	var mods string
+	for _, section := range descs {
+		for _, d := range section {
+			for _, n := range d.names() {
+				if n.name == cmd {
+					mods = n.mods
+				}
+			}
+		}
+	}
+	return mods
+}
+
+// Completions returns the names of the commands, with their backslash, for
+// the completer. A group of letters between brackets that names a kind of
+// object, as the a and n of df[an], adds each letter alone, and the modifiers
+// S, x and + add each combination of them, as Names does. So \d<Tab> offers
+// \dfa and \dfS+, and not \dfan. A deprecated command is left out.
+func Completions() []string {
+	seen := make(map[string]bool)
+	for _, section := range descs {
+		for _, d := range section {
+			if d.Deprecated {
+				continue
+			}
+			for _, name := range d.completions() {
+				seen[`\`+name] = true
+			}
+		}
+	}
+	return slices.Sorted(maps.Keys(seen))
+}
+
+// completions returns the names of the command for the completer.
+func (d desc) completions() []string {
+	i := strings.Index(d.Name, "[")
+	if i == -1 {
+		return []string{d.Name}
+	}
+	names := []string{d.Name[:i]}
+	for s := d.Name[i:]; s != ""; {
+		j := strings.Index(s, "]")
+		if s[0] != '[' || j == -1 {
+			panic(fmt.Sprintf("invalid command %q", d.Name))
+		}
+		var kinds, mods []rune
+		for _, c := range s[1:j] {
+			if strings.ContainsRune(modifierLetters, c) {
+				mods = append(mods, c)
+			} else {
+				kinds = append(kinds, c)
+			}
+		}
+		// a kind of object, alone
+		next := slices.Clone(names)
+		for _, c := range kinds {
+			for _, n := range names {
+				next = append(next, n+string(c))
+			}
+		}
+		names = next
+		// the modifiers, in every combination
+		for _, c := range mods {
+			for _, n := range names {
+				names = append(names, n+string(c))
+			}
+		}
+		s = s[j+1:]
+	}
+	return names
 }
 
 // wrap wraps a line of text to the specified width, and adding the prefix to
@@ -286,11 +682,36 @@ func wrap(s string, width, prefixWidth int) string {
 	for _, word := range words[1:] {
 		if left < len(word)+1 {
 			wrapped += "\n" + prefix + word
-			left = width - len(word)
+			left = width - prefixWidth - len(word)
 		} else {
 			wrapped += " " + word
 			left -= 1 + len(word)
 		}
 	}
 	return wrapped
+}
+
+// shellVarRE matches a variable in the text of a shell command: :name, and
+// :'name', which is quoted for the shell.
+var shellVarRE = regexp.MustCompile(`:'([\pL_][\pL\pN_]*)'|:([\pL_][\pL\pN_]*)`)
+
+// expandShell replaces the variables in the text of a command between
+// backticks, as psql does: :name by its value, and :'name' by its value quoted
+// for the shell. A variable that is not set stays as it is written.
+func expandShell(s string) string {
+	return shellVarRE.ReplaceAllStringFunc(s, func(m string) string {
+		sub := shellVarRE.FindStringSubmatch(m)
+		name, quoted := sub[2], false
+		if sub[1] != "" {
+			name, quoted = sub[1], true
+		}
+		v, ok := env.Vars().Get(name)
+		switch {
+		case !ok:
+			return m
+		case quoted:
+			return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
+		}
+		return v
+	})
 }

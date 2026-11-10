@@ -1,59 +1,261 @@
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
 name: Test usql
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
+  # Build and run the tests that need no database, on every platform usql
+  # supports. These catch the platform problems, which is where usql breaks
+  # most often: the driver set differs per platform and cgo has to link.
   test:
-    name: Build and Test usql
-    runs-on: ubuntu-24.04
-    services:
-      cassandra:
-        image: docker.io/usql/cassandra:latest
-        ports:
-          - 9042:9042
-      postgres:
-        image: docker.io/usql/postgres:latest
-        env:
-          POSTGRES_PASSWORD: P4ssw0rd
-        ports:
-          - 5432:5432
-      mysql:
-        image: docker.io/library/mariadb
-        env:
-          MYSQL_ROOT_PASSWORD: P4ssw0rd
-        ports:
-          - 3306:3306
-      sqlserver:
-        image: mcr.microsoft.com/mssql/server:2022-latest
-        env:
-          ACCEPT_EULA: Y
-          MSSQL_PID: Express
-          SA_PASSWORD: Adm1nP@ssw0rd
-        ports:
-          - 1433:1433
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-26.04-arm
+          - macos-latest
+          - windows-latest
     steps:
-    - name: Install Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: stable
-    - name: Install Packages
-      run: |
-        sudo apt-get -qq update
-        sudo apt-get install -y build-essential libicu-dev unixodbc unixodbc-dev
-    - name: Checkout code
-      uses: actions/checkout@v4
-    - name: Unit Tests
-      run: |
-        go test -v ./stmt
-    - name: Build with all drivers
-      run: |
-        ./build.sh -b -t all
-    - name: Shell Tests
-      run: |
-        go run testcli.go &> output.log
-        ls -alh output.log
-    - name: Archive output
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: output
-        path: output.log
-        if-no-files-found: error
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Install packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y build-essential libicu-dev unixodbc unixodbc-dev
+      # The duckdb driver links prebuilt static archives built by MinGW-Builds
+      # GCC 14.2.0 for x86_64, UCRT, posix-seh, and linking needs a toolchain
+      # matching all three. MSYS2 ships a newer gcc, which fails at link on
+      # __emutls_v._ZSt11__once_call, so the version is pinned with winget.
+      - name: Install MinGW toolchain for duckdb
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          winget install --id BrechtSanders.WinLibs.POSIX.UCRT.LLVM --exact --silent `
+            --accept-package-agreements --accept-source-agreements
+          $bin = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT.LLVM_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin'
+          if (-not (Test-Path $bin)) { throw "the toolchain is not at $bin" }
+          "$bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      # A mismatched toolchain only shows at link, with undefined symbols that
+      # name neither the runtime nor the version as the cause. Say it here.
+      #
+      # Do not test gcc -dumpmachine: it reports x86_64-w64-mingw32 for the
+      # MSVCRT and the UCRT builds alike. The UCRT headers define _UCRT.
+      - name: Check the toolchain
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          gcc --version
+          gcc -dumpmachine
+          # The duckdb archives were built by MinGW-Builds GCC 14.2.0 for UCRT
+          # with posix-seh. A mismatch on either axis only appears at link,
+          # with undefined symbols that name neither as the cause, so describe
+          # the toolchain here where it can be read plainly.
+          #
+          # This reports and never fails. The build that follows is the real
+          # test, and a wrong guess here must not be able to block a release.
+          #
+          # _UCRT comes from the UCRT headers rather than from the compiler,
+          # so a header has to be included before asking for it. Do not test
+          # gcc -dumpmachine either: it reports x86_64-w64-mingw32 for the
+          # MSVCRT and UCRT builds alike, because the target triple does not
+          # carry the runtime.
+          ucrt=no
+          if echo '#include <stdio.h>' | gcc -E -dM - 2>/dev/null | grep -q '^#define _UCRT'; then
+            ucrt=yes
+          fi
+          major=$(gcc -dumpversion 2>/dev/null | cut -d. -f1)
+          echo "runtime: UCRT=$ucrt  gcc major: $major"
+          if [ "$ucrt" != "yes" ]; then
+            echo "warning: this gcc targets MSVCRT, and the duckdb archives need UCRT." >&2
+            echo "         expect undefined references to __stdio_common_vsnprintf_s." >&2
+          fi
+          if [ "$major" != "14" ]; then
+            echo "warning: this gcc is $major, and the duckdb archives need 14." >&2
+            echo "         a newer libstdc++ drops emulated TLS, so expect an" >&2
+            echo "         undefined reference to __emutls_v._ZSt11__once_call." >&2
+          fi
+      - name: Build
+        shell: bash
+        run: ./build.sh -b
+      - name: Test
+        shell: bash
+        run: |
+          go test -tags "$(./build.sh -T)" \
+            ./feed/... \
+            ./env/... \
+            ./handler/... \
+            ./metacmd \
+            ./metacmd/complete \
+            ./metacmd/describe \
+            ./drivers
+      # The step above names its packages, and the chart renderer is not one
+      # of them. Test it here. It needs no database.
+      - name: Test the chart renderer
+        shell: bash
+        run: go test ./metacmd/charts/...
+
+  # Record terminal sessions against a real pseudo-terminal. usql turns off
+  # its prompt, line editor and colour when it does not own a terminal, so
+  # nothing else covers them. Windows has no pseudo-terminal device file, so
+  # it is absent here rather than skipped.
+  terminal:
+    name: Terminal sessions on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Record and compare
+        run: go test -v -tags "sqlite3 no_drivers" -run TestCLI .
+
+  # Build what the database jobs run, once.
+  #
+  # dbmeta's dbrun starts every database, which is hard rule 7. dbrun is built
+  # from the release of dbmeta that go.mod pins, so that the databases match
+  # the models that usql reads.
+  #
+  # Linking every driver takes most of the time of a job, so the binaries are
+  # built here and each job of the matrix downloads them.
+  databases:
+    name: Build dbrun and the database tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Install packages
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y build-essential libicu-dev unixodbc unixodbc-dev
+      - name: Read the release of dbmeta
+        id: dbmeta
+        run: echo "version=$(go list -m -f '{{.Version}}' github.com/xo/dbmeta)" >> "$GITHUB_OUTPUT"
+      - name: Checkout dbmeta
+        uses: actions/checkout@v7
+        with:
+          repository: xo/dbmeta
+          ref: ${{ steps.dbmeta.outputs.version }}
+          path: dbmeta
+      # usql is for dbrun fixture, which loads the fixture of an embedded
+      # database with usql. The tests are built with the tags of a release.
+      - name: Build
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          (cd dbmeta/test && go build -o "$RUNNER_TEMP/bin/dbrun" ./cmd/dbrun)
+          go build -tags "$(./build.sh -T)" -o "$RUNNER_TEMP/bin/usql" .
+          go test -tags "$(./build.sh -T)" -c -o "$RUNNER_TEMP/bin/drivers.test" ./drivers
+      - name: Upload them
+        uses: actions/upload-artifact@v7
+        with:
+          name: databases-bin
+          path: |
+            ${{ runner.temp }}/bin/dbrun
+            ${{ runner.temp }}/bin/usql
+            ${{ runner.temp }}/bin/drivers.test
+          retention-days: 1
+          if-no-files-found: error
+
+  # One job for each of the main databases. The other databases are tested
+  # locally, as CONTRIBUTING.md says. dbrun starts each one and loads its fixture
+  # examples, the tables authors and books. Then the tests of drivers that
+  # need a database run against it: TestConnect on every database,
+  # TestDescribe and TestCopy on each that holds the fixture, and TestDump on
+  # each that usql can dump.
+  database:
+    name: ${{ matrix.server }}
+    needs: databases
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        server:
+          - postgres-18
+          - sqlserver-2025
+          - mysql-26.7
+          - sqlite3
+          - duckdb
+    env:
+      DBMETA_RUNNER: docker
+      DBMETA_OWNER_NAME: usql
+      USQL_TEST_NAME: ${{ matrix.server }}
+    steps:
+      # The tests read drivers/testdata at run time.
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Download the binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: databases-bin
+          path: ${{ runner.temp }}/bin
+      # The artifact does not carry the mode bit. dbrun fixture finds usql
+      # on the path. An embedded database is a file in DBMETA_EMBEDDED_STATE,
+      # and the directory must exist before usql opens the file.
+      - name: Prepare
+        run: |
+          chmod +x "$RUNNER_TEMP/bin/dbrun" "$RUNNER_TEMP/bin/usql" "$RUNNER_TEMP/bin/drivers.test"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          mkdir -p "$RUNNER_TEMP/embedded"
+          echo "DBMETA_EMBEDDED_STATE=$RUNNER_TEMP/embedded" >> "$GITHUB_ENV"
+      # The URL holds the password of the server. It goes to the next steps
+      # through GITHUB_ENV, which the log does not show, and add-mask hides
+      # it in anything that prints it, such as the line of dbrun start.
+      - name: Read the URL of ${{ matrix.server }}
+        run: |
+          url=$(dbrun dsn --json "$USQL_TEST_NAME" | jq -r '.[0].url')
+          pass=$(printf '%s' "$url" | python3 -c 'import sys, urllib.parse as p; print(p.urlsplit(sys.stdin.read()).password or "")')
+          if [ -n "$pass" ]; then
+            echo "::add-mask::$pass"
+            echo "::add-mask::$(printf '%s' "$pass" | python3 -c 'import sys, urllib.parse as p; print(p.unquote(sys.stdin.read()))')"
+          fi
+          echo "USQL_TEST_URL=$url" >> "$GITHUB_ENV"
+      - name: Start ${{ matrix.server }}
+        run: dbrun start "$USQL_TEST_NAME"
+      # dbrun has the fixture for some products only. On the others the
+      # tests that need it skip, unless the database has a recording.
+      - name: Load the fixture examples
+        run: |
+          if ! dbrun fixture examples "$USQL_TEST_NAME"; then
+            echo "::notice::dbrun did not load the fixture examples on $USQL_TEST_NAME"
+          fi
+      # TestDump compares a copy that usql made with a copy that pg_dump
+      # made, and skips when pg_dump is older than the server. The runner has
+      # an older pg_dump, so the client of the release comes from PGDG.
+      - name: Install the client of PostgreSQL 18
+        if: matrix.server == 'postgres-18'
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-client-18
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+      - name: Test against ${{ matrix.server }}
+        working-directory: drivers
+        run: |
+          "$RUNNER_TEMP/bin/drivers.test" -test.v -test.count=1 \
+            -test.run '^(TestConnect|TestDescribe|TestCopy|TestDump)$'
+      - name: Show the log of ${{ matrix.server }}
+        if: failure()
+        run: dbrun logs "$USQL_TEST_NAME" || true

@@ -1,0 +1,113 @@
+# usql capture transcript v1
+session: line-editing
+about: the line editor handles backspace and start of line, and Enter runs a finished entry wherever the cursor is
+term: xterm-256color
+size: 80x24
+
+## step 0
+send:
+
+recv:
+\e[mConnected with driver sqlite3 (VERSION)\r
+\n
+\e[0cType "help" for help.\r
+\n
+\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 1
+send:
+select 11 as nn;
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mselect\e[39m \e[38;5;141m11\e[39m \e[38;5;81mas\e[39m \e[38;5;231mnn;\e[39m\e[K\r
+\e[30C
+
+
+## step 2
+send:
+\x7f\x7f
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mselect\e[39m \e[38;5;141m11\e[39m \e[38;5;81mas\e[39m \e[38;5;231mn\e[39m\e[K\r
+\e[28C
+
+
+## step 3
+send:
+x;
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mselect\e[39m \e[38;5;141m11\e[39m \e[38;5;81mas\e[39m \e[38;5;231mnx;\e[39m\e[K\r
+\e[30C
+
+
+## step 4
+send:
+\x01
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mselect\e[39m \e[38;5;141m11\e[39m \e[38;5;81mas\e[39m \e[38;5;231mnx;\e[39m\e[K\r
+\e[14C
+
+
+## step 5
+send:
+select 2 as n; 
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mselect\e[39m \e[38;5;141m2\e[39m \e[38;5;81mas\e[39m \e[38;5;231mn;\e[39m \e[38;5;81mselect\e[39m \e[38;5;141m11\e[39m \e[38;5;81mas\e[39m \e[38;5;231mnx;\e[39m\e[K\r
+\e[29C
+
+
+## step 6
+send:
+\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mselect\e[39m \e[38;5;141m2\e[39m \e[38;5;81mas\e[39m \e[38;5;231mn;\e[39m \e[38;5;81mselect\e[39m \e[38;5;141m11\e[39m \e[38;5;81mas\e[39m \e[38;5;231mnx;\e[39m\e[K\r
+\e[45C\e[?2004l\r
+\n
+ n \r
+\n
+---\r
+\n
+ 2\r
+\n
+(1 row)\r
+\n
+\r
+\n
+ nx \r
+\n
+----\r
+\n
+ 11\r
+\n
+(1 row)\r
+\n
+\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 7
+send:
+\\q\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\q\e[39m\e[K\r
+\e[16C\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\q\e[39m\e[K\r
+\e[16C\e[?2004l\r
+\n
+

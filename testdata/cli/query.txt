@@ -1,0 +1,55 @@
+# usql capture transcript v1
+session: query
+about: a query prints a result table and a row count
+term: xterm-256color
+size: 80x24
+
+## step 0
+send:
+
+recv:
+\e[mConnected with driver sqlite3 (VERSION)\r
+\n
+\e[0cType "help" for help.\r
+\n
+\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 1
+send:
+select 1 as n, 'two' as s;\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mselect\e[39m \e[38;5;141m1\e[39m \e[38;5;81mas\e[39m \e[38;5;231mn,\e[39m \e[38;5;186m'two'\e[39m \e[38;5;81mas\e[39m \e[38;5;231ms;\e[39m\e[K\r
+\e[40C\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mselect\e[39m \e[38;5;141m1\e[39m \e[38;5;81mas\e[39m \e[38;5;231mn,\e[39m \e[38;5;186m'two'\e[39m \e[38;5;81mas\e[39m \e[38;5;231ms;\e[39m\e[K\r
+\e[40C\e[?2004l\r
+\n
+ n |  s  \r
+\n
+---+-----\r
+\n
+ 1 | two\r
+\n
+(1 row)\r
+\n
+\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 2
+send:
+\\q\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\q\e[39m\e[K\r
+\e[16C\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\q\e[39m\e[K\r
+\e[16C\e[?2004l\r
+\n
+

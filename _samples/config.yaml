@@ -1,0 +1,71 @@
+---
+# Each section holds the settings of one kind. \config shows and sets any of
+# them by its full name, as in \config print.border 2, and -O sets it on the
+# command line, as in -O print.border=2.
+
+# the settings of usql (\uset)
+usql:
+  on_error_stop: off
+  syntax_hl_style: onedark
+
+# the display formatting settings (\pset)
+print:
+  border: 1
+  null: ""
+
+# the script variables (\set)
+vars:
+  SCHEMA: public
+
+# the settings of \chart. charts.path is relative to the directory of this
+# file.
+charts:
+  path: charts
+
+# variables added to the environment of the commands that usql runs, such as
+# the pager, the editor and \! (\setenv)
+env:
+  PGAPPNAME: usql
+
+# named connections (\cset)
+connections:
+  my_couchbase_conn: couchbase://Administrator:P4ssw0rd@localhost
+  my_clickhouse_conn: clickhouse://clickhouse:P4ssw0rd@localhost
+  css: cassandra://cassandra:cassandra@localhost
+  fsl: flightsql://flight_username:P4ssw0rd@localhost
+  ora:
+    protocol: oracle
+    username: system
+    password: P4ssw0rd
+    hostname: localhost
+    port: 1521
+    database: free
+  mss: sqlserver://sa:Adm1nP@ssw0rd@localhost
+  mym: mysql://root:P4ssw0rd@localhost
+  #ora: oracle://system:P4ssw0rd@localhost/free
+  ore: oracle://system:P4ssw0rd@localhost:1522/db1
+  pgs: postgres://postgres:P4ssw0rd@localhost
+  pgx: pgx://postgres:P4ssw0rd@localhost
+  vrt:
+    proto: vertica
+    user: vertica
+    pass: vertica
+    host: localhost
+  sll:
+    file: /path/to/mydb.sqlite3
+  mdc: modernsqlite:test.db
+  dkd: test.duckdb
+  zz2:
+    proto: mysql
+    user: "my username"
+    pass: "my password!"
+    host: localhost
+    opts:
+      opt1: "😀"
+
+# meta commands of the user: \tables runs \dt+. Only this file sets an alias.
+aliases:
+  tables: '\dt+'
+  hello: |
+    \echo hello
+    \echo from usql

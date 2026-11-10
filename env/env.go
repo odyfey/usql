@@ -4,13 +4,13 @@ package env
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -34,9 +34,9 @@ func Vars() *Variables {
 	return vars
 }
 
-// Get returns a standard variable.
-func Get(name string) string {
-	value, _ := vars.Get(name)
+// Setting returns a setting of the application, such as PAGER.
+func Setting(name string) string {
+	value, _ := vars.Setting(name)
 	return value
 }
 
@@ -95,16 +95,21 @@ func OpenFile(u *user.User, path string) (string, *os.File, error) {
 
 // EditFile edits a file. If path is empty, then a temporary file will be
 // created.
+//
+// The editor runs through the shell, as psql runs it, so that the editor
+// setting can hold arguments, such as code --wait.
 func EditFile(u *user.User, path, line string, buf []byte) ([]byte, error) {
-	ed, _ := vars.Get("EDITOR")
-	switch {
-	case ed == "":
-		if ed, _ = exec.LookPath("vi"); ed == "" {
+	ed, _ := vars.Setting("editor")
+	if ed == "" {
+		vi, err := exec.LookPath("vi")
+		if err != nil {
 			return nil, text.ErrNoEditorDefined
 		}
-	case path != "":
+		ed = shellQuote(vi)
+	}
+	if path != "" {
 		path = passfile.Expand(u.HomeDir, path)
-	default:
+	} else {
 		f, err := os.CreateTemp("", text.CommandLower()+".*.sql")
 		if err != nil {
 			return nil, err
@@ -118,18 +123,22 @@ func EditFile(u *user.User, path, line string, buf []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
-	// setup args
-	args := []string{path}
+	// the line goes before the path, as psql passes it
+	cmd := ed
 	if line != "" {
 		if s, ok := Getenv(text.CommandUpper() + "_EDITOR_LINENUMBER_ARG"); ok {
-			args = append(args, s+line)
+			cmd += " " + shellQuote(s+line)
 		} else {
-			args = append(args, "+"+line)
+			cmd += " " + shellQuote("+"+line)
 		}
 	}
-	// create command
-	c := exec.Command(ed, args...)
-	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd += " " + shellQuote(path)
+	shell, param := Getshell()
+	if shell == "" {
+		return nil, text.ErrNoShellAvailable
+	}
+	c := exec.Command(shell, param, cmd)
+	c.Stdin, c.Stdout, c.Stderr, c.Env = os.Stdin, os.Stdout, os.Stderr, vars.Environ()
 	if err := c.Run(); err != nil {
 		return nil, err
 	}
@@ -141,40 +150,95 @@ func EditFile(u *user.User, path, line string, buf []byte) ([]byte, error) {
 	return bytes.TrimSuffix(buf, lineend), nil
 }
 
-// HistoryFile returns the path to the history file.
-//
-// Defaults to ~/.<command name>_history, overridden by environment variable
-// <COMMAND NAME>_HISTORY (ie, ~/.usql_history and USQL_HISTORY).
+// shellQuote quotes s as one argument for the shell that Getshell returns.
+func shellQuote(s string) string {
+	if runtime.GOOS == "windows" {
+		return `"` + s + `"`
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// HistoryFile returns the path of the history file: the file that
+// USQL_HISTORY names, or else history in the state directory of usql. It
+// returns an empty path when there is no such directory.
 func HistoryFile(u *user.User) string {
-	n := text.CommandUpper() + "_HISTORY"
-	path := "~/." + strings.ToLower(n)
-	if s, ok := Getenv(n); ok {
-		path = s
+	if s, ok := Getenv(text.CommandUpper() + "_HISTORY"); ok {
+		return passfile.Expand(u.HomeDir, s)
 	}
-	return passfile.Expand(u.HomeDir, path)
+	dir, err := StateDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "history")
 }
 
-// RCFile returns the path to the RC file.
+// InitFile returns the path of the file that runs at start: the file that
+// USQLRC names, or else init.sql in the configuration directory of usql. It
+// returns an empty path when there is no such directory.
+func InitFile(u *user.User) string {
+	if s, ok := Getenv(text.CommandUpper() + "RC"); ok {
+		return passfile.Expand(u.HomeDir, s)
+	}
+	dir, err := ConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "init.sql")
+}
+
+// ConfigDir returns the configuration directory of usql:
+// $XDG_CONFIG_HOME/usql on Linux and other Unix systems, which is
+// ~/.config/usql when XDG_CONFIG_HOME is not set, ~/Library/Application
+// Support/usql on macOS, and %AppData%\usql on Windows.
+func ConfigDir() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, text.CommandName), nil
+}
+
+// StateDir returns the directory of what usql keeps from one run to the next,
+// such as its history: $XDG_STATE_HOME/usql on Linux and other Unix systems,
+// which is ~/.local/state/usql when XDG_STATE_HOME is not set, the
+// configuration directory on macOS, and %LocalAppData%\usql on Windows.
 //
-// Defaults to ~/.<command name>rc, overridden by environment variable
-// <COMMAND NAME>RC (ie, ~/.usqlrc and USQLRC).
-func RCFile(u *user.User) string {
-	n := text.CommandUpper() + "RC"
-	path := "~/." + strings.ToLower(n)
-	if s, ok := Getenv(n); ok {
-		path = s
+// The XDG Base Directory specification says to ignore a relative path in
+// XDG_STATE_HOME, and so does StateDir.
+func StateDir() (string, error) {
+	switch runtime.GOOS {
+	case "windows":
+		dir := os.Getenv("LocalAppData")
+		if dir == "" {
+			return "", errors.New("%LocalAppData% is not defined")
+		}
+		return filepath.Join(dir, text.CommandName), nil
+	case "darwin", "ios":
+		return ConfigDir()
 	}
-	return passfile.Expand(u.HomeDir, path)
+	dir := os.Getenv("XDG_STATE_HOME")
+	if !filepath.IsAbs(dir) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		dir = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(dir, text.CommandName), nil
 }
 
-// Getshell returns the user's defined SHELL, or system default (if found on
+// Getshell returns the user's defined shell, or system default (if found on
 // path) and the appropriate command-line argument for the returned shell.
 //
-// Looks at the SHELL environment variable first, and then COMSPEC/ComSpec on
-// Windows. Defaults to sh on non-Windows systems, and to cmd.exe on Windows.
+// Looks at the USQL_SHELL and SHELL environment variables first, and then
+// COMSPEC/ComSpec on Windows. Defaults to sh on non-Windows systems, and to
+// cmd.exe on Windows. cmd.exe takes /c, and any other shell -c.
 func Getshell() (string, string) {
-	shell, ok := Getenv("SHELL")
+	shell, ok := Getenv(text.CommandUpper()+"_SHELL", "SHELL")
 	param := "-c"
+	if ok && strings.TrimSuffix(strings.ToLower(filepath.Base(shell)), ".exe") == "cmd" {
+		param = "/c"
+	}
 	if !ok && runtime.GOOS == "windows" {
 		shell, _ = Getenv("COMSPEC", "ComSpec")
 		param = "/c"
@@ -196,7 +260,7 @@ func Getshell() (string, string) {
 	return shell, param
 }
 
-// Shell runs s as a shell. When s is empty the user's SHELL or COMSPEC is
+// Shell runs s as a shell. When s is empty the user's shell or COMSPEC is
 // used. See Getshell.
 func Shell(s string) error {
 	shell, param := Getshell()
@@ -210,7 +274,7 @@ func Shell(s string) error {
 	}
 	// drop to shell
 	cmd := exec.Command(shell, params...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Stdin, cmd.Stdout, cmd.Stderr, cmd.Env = os.Stdin, os.Stdout, os.Stderr, vars.Environ()
 	_ = cmd.Run()
 	return nil
 }
@@ -222,7 +286,7 @@ func Pipe(stdout, stderr io.Writer, c string) (io.WriteCloser, *exec.Cmd, error)
 		return nil, nil, text.ErrNoShellAvailable
 	}
 	cmd := exec.Command(shell, param, c)
-	cmd.Stdout, cmd.Stderr = stdout, stderr
+	cmd.Stdout, cmd.Stderr, cmd.Env = stdout, stderr, vars.Environ()
 	out, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, nil, err
@@ -230,10 +294,10 @@ func Pipe(stdout, stderr io.Writer, c string) (io.WriteCloser, *exec.Cmd, error)
 	return out, cmd, cmd.Start()
 }
 
-// Exec executes s using the user's SHELL / COMSPEC with -c (or /c) and
+// Exec executes s using the user's shell / COMSPEC with -c (or /c) and
 // returning the captured output. See Getshell.
 //
-// When SHELL or COMSPEC is not defined, then "sh" / "cmd.exe" will be used
+// When USQL_SHELL, SHELL or COMSPEC is not defined, then "sh" / "cmd.exe" will be used
 // instead, assuming it is found on the system's PATH.
 func Exec(s string) (string, error) {
 	s = strings.TrimSpace(s)
@@ -244,7 +308,9 @@ func Exec(s string) (string, error) {
 	if shell == "" {
 		return "", text.ErrNoShellAvailable
 	}
-	buf, err := exec.Command(shell, param, s).CombinedOutput()
+	cmd := exec.Command(shell, param, s)
+	cmd.Env = vars.Environ()
+	buf, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", err
 	}
@@ -255,6 +321,13 @@ func Exec(s string) (string, error) {
 }
 
 // Unquote unquotes a string.
+//
+// A string between single quotes is read as psql reads the argument of a
+// meta command: ” is a quote, \n, \t, \b, \r and \f are control
+// characters, one to three octal digits and \x with one or two hex digits are
+// a byte, and a backslash before any other character is that character, as in
+// \q for q. A string between double quotes or backticks loses its quotes, and
+// keeps the escapes of Go.
 func Unquote(s string) (string, error) {
 	switch n := len(s); {
 	case n == 0:
@@ -265,7 +338,7 @@ func Unquote(s string) (string, error) {
 	quote := s[0]
 	s = s[1 : len(s)-1]
 	if quote == '\'' {
-		s = cleanDoubleRE.ReplaceAllString(s, `$1\'`)
+		return unquoteSingle(s)
 	}
 	// this is the last part of strconv.Unquote
 	var runeTmp [utf8.UTFMax]byte
@@ -289,38 +362,68 @@ func Unquote(s string) (string, error) {
 	return string(buf), nil
 }
 
-// Untick returns a func that unquotes and unticks strings for the user.
-//
-// When exec is true, backtick'd strings will be executed using the provided
-// user's shell (see Exec).
-func Untick(u *user.User, v *Variables, exec bool) func(string, bool) (string, bool, error) {
-	return func(s string, isvar bool) (string, bool, error) {
-		// fmt.Fprintf(os.Stderr, "untick: %q\n", s)
-		switch {
-		case isvar:
-			value, ok := v.Get(s)
-			return value, ok, nil
-		case len(s) < 2:
-			return "", false, text.ErrInvalidQuotedString
+// unquoteSingle decodes the text between single quotes as psql decodes the
+// argument of a meta command.
+func unquoteSingle(s string) (string, error) {
+	buf := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '\'' && i+1 < len(s) && s[i+1] == '\'':
+			buf = append(buf, c)
+			i++
+		case c == '\'':
+			return "", text.ErrInvalidQuotedString
+		case c != '\\' || i+1 == len(s):
+			buf = append(buf, c)
+		default:
+			i++
+			switch c = s[i]; {
+			case c == 'n':
+				buf = append(buf, '\n')
+			case c == 't':
+				buf = append(buf, '\t')
+			case c == 'b':
+				buf = append(buf, '\b')
+			case c == 'r':
+				buf = append(buf, '\r')
+			case c == 'f':
+				buf = append(buf, '\f')
+			case '0' <= c && c <= '7':
+				// one to three octal digits
+				v, j := 0, i
+				for ; j < len(s) && j < i+3 && '0' <= s[j] && s[j] <= '7'; j++ {
+					v = v*8 + int(s[j]-'0')
+				}
+				buf, i = append(buf, byte(v)), j-1
+			case c == 'x' && i+1 < len(s) && isHex(s[i+1]):
+				// one or two hex digits
+				v, j := 0, i+1
+				for ; j < len(s) && j < i+3 && isHex(s[j]); j++ {
+					v = v*16 + hexValue(s[j])
+				}
+				buf, i = append(buf, byte(v)), j-1
+			default:
+				buf = append(buf, c)
+			}
 		}
-		c := s[0]
-		z, err := Unquote(s)
-		switch {
-		case err != nil:
-			return "", false, err
-		case c == '\'', c == '"':
-			return z, true, nil
-		case c != '`':
-			return "", false, text.ErrInvalidQuotedString
-		case !exec:
-			return z, true, nil
-		}
-		res, err := Exec(z)
-		if err != nil {
-			return "", false, err
-		}
-		return res, true, nil
 	}
+	return string(buf), nil
+}
+
+// isHex reports whether c is a hex digit.
+func isHex(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+// hexValue returns the value of the hex digit c.
+func hexValue(c byte) int {
+	switch {
+	case c <= '9':
+		return int(c - '0')
+	case c <= 'F':
+		return int(c-'A') + 10
+	}
+	return int(c-'a') + 10
 }
 
 // Quote quotes a string.
@@ -333,7 +436,7 @@ func Quote(s string) string {
 // environment variable.
 func TermGraphics() rasterm.TermType {
 	var typ rasterm.TermType
-	s, _ := vars.Get("TERM_GRAPHICS")
+	s, _ := vars.Setting("term_graphics")
 	_ = typ.UnmarshalText([]byte(s))
 	return typ
 }
@@ -363,6 +466,40 @@ func ParseBool(value, name string) (string, error) {
 	return "", fmt.Errorf(text.FormatFieldInvalidValue, value, name, "Boolean")
 }
 
+// ParseVariableBool reads value as a boolean, as psql's ParseVariableBool
+// reads the expression of \if. It takes true, false, yes, no, on, off, 1 and
+// 0, in any case. A prefix of a word is enough when it is unique, so t is
+// true and n is no. A prefix of on or off needs two letters, because o starts
+// both. It reports false when value is not a boolean.
+func ParseVariableBool(value string) (v, ok bool) {
+	switch {
+	case hasPrefixFold("true", value, 1), hasPrefixFold("yes", value, 1), hasPrefixFold("on", value, 2), value == "1":
+		return true, true
+	case hasPrefixFold("false", value, 1), hasPrefixFold("no", value, 1), hasPrefixFold("off", value, 2), value == "0":
+		return false, true
+	}
+	return false, false
+}
+
+// hasPrefixFold reports whether s is a prefix of word of at least n bytes,
+// where word is in lower case. Only the ASCII letters of s fold, as in psql,
+// so the long s (U+017F) does not match an s.
+func hasPrefixFold(word, s string, n int) bool {
+	if len(s) < n || len(s) > len(word) {
+		return false
+	}
+	for i := range len(s) {
+		c := s[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != word[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func ParseKeywordBool(value, name string, keywords ...string) (string, error) {
 	v := strings.ToLower(value)
 	switch v {
@@ -381,6 +518,3 @@ func ParseKeywordBool(value, name string, keywords ...string) (string, error) {
 
 // lineend is the line ending.
 var lineend = []byte{'\n'}
-
-// cleanDoubleRE matches double quotes.
-var cleanDoubleRE = regexp.MustCompile(`(^|[^\\])''`)

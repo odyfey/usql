@@ -1,0 +1,156 @@
+# Rules for agents working on usql
+
+This file holds rules that an agent can break without noticing. It is not a
+design document. The reasoning behind the project lives in the documents listed
+below.
+
+## Standing rules
+
+These hold in every `xo` repository, for every coding agent (D1).
+
+1. Stage changes for review. Commit and push only when a maintainer says so.
+2. Load the `simple-english` skill before you write any text that a person
+   reads: a document, a code comment, an error message or a commit message.
+   Follow it for that text.
+3. Load the `go-pedantry` skill before you write or review Go code. Follow it
+   where it does not conflict with a rule in this file. A rule here wins.
+
+`CLAUDE.md` holds one line that imports this file, so that Claude Code and
+every other agent read the same rules. Edit this file, not that one.
+
+## Which document to read
+
+| Task | Document |
+| --- | --- |
+| Adding a database driver | [docs/DRIVER.md](docs/DRIVER.md) |
+| Adding a connection scheme | `docs/SCHEME.md` in [dburl](https://github.com/xo/dburl) |
+| A driver that is broken or unmaintained | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Putting a feature behind a build tag | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Running the tests | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Regenerating the examples of the README | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Measuring what each driver adds to the binary | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Moving metadata to dbmeta | [docs/DBMETA.md](docs/DBMETA.md) |
+| Planned work, and how to cite it | [docs/BACKLOG.md](docs/BACKLOG.md) |
+| The plan, and the questions open for the maintainers | [docs/PLAN.md](docs/PLAN.md) |
+| Picking up the work in progress | [docs/PROGRESS.md](docs/PROGRESS.md) |
+| What changed for the next release, and what to check | [docs/RELEASE.md](docs/RELEASE.md) |
+| Why something is the way it is | [docs/decisions/README.md](docs/decisions/README.md) |
+| Installing the agent skills | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| What usql does, for a user | [README.md](README.md) |
+
+A document that is not in this table does not exist. If you find one, either
+add a row for it or delete it.
+
+## Hard rules
+
+1. Do not edit generated files. `internal/*.go`, `metacmd/descs.go`, the
+   driver tables in `README.md`, the blocks of `README.md` that have an
+   `<!-- EXAMPLE name -->` marker, `LICENSE` and `text/license.go` are all
+   produced by `gen.go`.
+   Change `gen.go` or the source it reads, such as
+   `internal/readme/examples.go`, then regenerate.
+
+2. Do not write connection string parsing in this repository. All of it lives
+   in `github.com/xo/dburl`. A scheme must exist there before usql can use it.
+
+3. Run `go run gen.go` to regenerate. It reads dburl's scheme registry from
+   the version pinned in `go.mod`, not from a dburl checkout. A change in
+   dburl reaches the README tables only after `go.mod` moves to a dburl
+   release that holds it.
+
+4. Build and test with no build tags before claiming that a driver change
+   works, because only that build links every driver. A duplicate scheme or
+   alias panics at registration time, which a build that leaves a driver out
+   does not reach. Also build with `-tags 'no_drivers <tag>'`, which finds a
+   driver that compiles only beside another.
+
+5. Compilation is not evidence that a driver works. Nearly every field of
+   `drivers.Driver` is optional, so a driver that cannot connect still
+   compiles, registers, and passes `go test ./...`.
+
+6. No test of usql starts a database, and every test must pass wherever
+   usql builds. A test that needs a database reads its URL from the
+   environment, and skips when that is not set, so `go test ./...` passes
+   on a machine with no database. The tests of `drivers/dbrun_test.go` read
+   `USQL_TEST_URL`. CONTRIBUTING.md says how to run them.
+
+7. Start a database only with dbmeta's `dbrun`, never with a container
+   command of usql's own. dbmeta owns every container setup.
+
+8. Backlog identifiers are append only. Never reuse a `W` number and never
+   renumber one. An item that is finished or abandoned keeps its heading and
+   gains a status. See the rules at the top of `docs/BACKLOG.md`.
+
+9. A driver may register itself with `database/sql` and do nothing else. A
+   driver that writes global process state from `init()` goes out of the
+   tree. `slog.SetDefault` is the case that has already happened.
+
+10. usql has one build, and every driver is in it. Do not add a build group,
+    or a build tag that selects more than one driver. `no_<tag>` leaves one
+    driver out, and `no_drivers` leaves out every driver that the build does
+    not name by its tag. A driver that needs no hook gets no package under
+    `drivers`. It gets an entry in `plainDrivers` in `gen.go`.
+
+11. The repository root holds four documents: `README.md`, `AGENTS.md`,
+    `CLAUDE.md` and `CONTRIBUTING.md`. Every other document goes under
+    `docs/`. See D1.
+
+12. Do not add an alias for a connection scheme spelling you have not seen in
+    use. usql publishes every alias in its README table, so an alias is
+    advertised from the moment it exists, and removing one is a break.
+
+13. Do not write or change a metadata reader. All database metadata comes
+    from `dbmeta`, and `metacmd/describe` takes no new reader and no fix. A
+    new driver registers no reader. Its describe commands work when dbmeta
+    has a model for its database, and report that they are not supported
+    when it has none. See D3 and D4.
+
+## Writing
+
+Documentation and comments in this project are written in plain English.
+Short sentences, active voice, no semicolons, and no em dashes. State the fact
+rather than its importance.
+
+Do not name a maintainer in the documentation or in a comment. Write "the
+maintainer" for a decision that was made, with its date, and "a maintainer"
+for a rule or for something still to decide.
+
+Where a number in prose can be generated from something the code already
+knows, generate it. `gen.go` builds the README driver tables from dburl's
+registry for this reason: a generated table cannot go stale, because there is
+nothing for it to drift from.
+
+Where a number cannot be generated, a test must check it. Put the unit into
+the sentence the test searches, so that changing the unit breaks the test.
+Every wrong figure found in this project so far was a right count of the wrong
+thing.
+
+## Sibling repositories
+
+usql belongs to a family of repositories, and requires most of them in
+`go.mod`. Changes often cross between them.
+
+| Repository | What it holds |
+| --- | --- |
+| `xo/dburl` | Connection string parsing, schemes, aliases, file types |
+| `xo/dbmeta` | Database metadata, which usql's describe commands read |
+| `xo/tblfmt` | Result set formatting |
+| `xo/rline` | Line editing |
+| `xo/dbimp` | Pure Go database/sql drivers, over HTTP and WebSocket, for most of the drivers usql ships |
+| `xo/transit` | The grammar that splits usql's input into statements and meta commands |
+| `xo/cassandra` | The Cassandra driver |
+| `xo/odbc` | The ODBC driver |
+| `xo/dbtpl` | Code generation from database schemas |
+| `xo/dbfwd` | Forwards to databases in Kubernetes, which usql opens from a `k8s` URL |
+| `xo/oracle` | The Oracle driver |
+| `xo/echartsgoja` and `xo/okage` | The chart renderer of `\chart`: ECharts in a JavaScript engine, and the pure Go rasterizer of its SVG, in `okage/svg` |
+| `xo/terminfo` | The color depth of the terminal |
+| `xo/ox` | A command line parser, planned to replace cobra and viper (W80) |
+
+usql records its own decisions as `D1`, `D2` and so on, one file each in
+`docs/decisions/`. `dburl` and `dbmeta` number theirs the same way, so a
+reference to another repository's decision names the repository, as in
+"dburl's D22". A bare number means usql's own. Decisions are separate from
+this project's `W` work items. Do not mix the series in one commit message.
+
+When a driver is dropped from usql, its scheme is dropped from dburl.

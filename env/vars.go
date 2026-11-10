@@ -1,9 +1,11 @@
 package env
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"os/exec"
 	"slices"
 	"strconv"
@@ -12,37 +14,52 @@ import (
 
 	syslocale "github.com/jeandeaual/go-locale"
 	"github.com/xo/terminfo"
+	"github.com/xo/transit/styles"
+	"github.com/xo/usql/feed"
 	"github.com/xo/usql/text"
 )
 
 // Variables handles the standard, print, and connection variables.
 type Variables struct {
-	// vars holds standard variables.
+	// vars holds standard variables, which scripts use.
 	vars map[string]string
+	// uset holds the settings of the application, which \uset sets.
+	uset map[string]string
 	// prnt holds print variables ("print" is a reserved word).
 	prnt map[string]string
 	// conn holds connection variables.
 	conn map[string][]string
+	// charts holds the settings of \chart.
+	charts map[string]string
+	// env holds the variables that the programs of usql get in their
+	// environment, and envUnset the ones that they do not get.
+	env      map[string]string
+	envUnset map[string]bool
+	// aliases holds the meta commands of the user, which only the
+	// configuration file sets.
+	aliases map[string]string
 }
 
 // NewVars creates a set of empty variables.
 func NewVars() *Variables {
 	return &Variables{
-		vars: make(map[string]string),
-		prnt: make(map[string]string),
-		conn: make(map[string][]string),
+		vars:     make(map[string]string),
+		uset:     make(map[string]string),
+		prnt:     make(map[string]string),
+		conn:     make(map[string][]string),
+		charts:   map[string]string{"path": "charts"},
+		env:      make(map[string]string),
+		envUnset: make(map[string]bool),
+		aliases:  make(map[string]string),
 	}
 }
 
-// NewDefaultVars creates standard, print, and connection variables, based on
-// environment variables.
+// NewDefaultVars creates the variables and the settings with their defaults.
+// A default can come from a variable of the environment that is not usql's
+// own, such as PAGER, EDITOR and NO_COLOR. The variables of usql, such as
+// USQL_PAGER, come later, from ApplyEnviron, so that they win over the
+// configuration file.
 func NewDefaultVars() *Variables {
-	cmdNameUpper := strings.ToUpper(text.CommandName)
-	// get USQL_* variables
-	showHostInformation := "true"
-	if v, _ := Getenv(cmdNameUpper + "_SHOW_HOST_INFORMATION"); v != "" {
-		showHostInformation = v
-	}
 	// get NO_COLOR
 	noColor := false
 	if s, ok := Getenv("NO_COLOR"); ok {
@@ -55,7 +72,7 @@ func NewDefaultVars() *Variables {
 		enableSyntaxHL = "false"
 	}
 	// pager
-	pagerCmd, ok := Getenv(cmdNameUpper+"_PAGER", "PAGER")
+	pagerCmd, ok := Getenv("PAGER")
 	pager := "off"
 	if !ok {
 		for _, s := range []string{"less", "more"} {
@@ -69,9 +86,9 @@ func NewDefaultVars() *Variables {
 		pager = "on"
 	}
 	// editor
-	editorCmd, _ := Getenv(cmdNameUpper+"_EDITOR", "EDITOR", "VISUAL")
+	editorCmd, _ := Getenv("EDITOR", "VISUAL")
 	// sslmode
-	sslmode, ok := Getenv(cmdNameUpper+"_SSLMODE", "SSLMODE")
+	sslmode, ok := Getenv("SSLMODE")
 	if !ok {
 		sslmode = "retry"
 	}
@@ -81,22 +98,27 @@ func NewDefaultVars() *Variables {
 		locale = s
 	}
 	return &Variables{
-		vars: map[string]string{
+		vars: make(map[string]string),
+		uset: map[string]string{
 			// usql related logic
-			"SHOW_HOST_INFORMATION": showHostInformation,
-			"PAGER":                 pagerCmd,
-			"EDITOR":                editorCmd,
-			"QUIET":                 "off",
-			"ON_ERROR_STOP":         "off",
+			"show_host_information": "true",
+			"pager":                 pagerCmd,
+			"editor":                editorCmd,
+			"quiet":                 "off",
+			"on_error_stop":         "off",
+			"echo_hidden":           "off",
+			"fetch_count":           "0",
 			// prompts
-			"PROMPT1": "%S%N%m%/%R%# ",
+			"prompt1": "%S%N%m%/%R%# ",
+			"prompt2": "%S%N%m%/%R%# ",
 			// syntax highlighting variables
-			"SYNTAX_HL":             enableSyntaxHL,
-			"SYNTAX_HL_FORMAT":      colorLevel.ChromaFormatterName(),
-			"SYNTAX_HL_STYLE":       "monokai",
-			"SYNTAX_HL_OVERRIDE_BG": "true",
-			"SSLMODE":               sslmode,
-			"TERM_GRAPHICS":         "none",
+			"syntax_hl":             enableSyntaxHL,
+			"syntax_hl_format":      colorLevel.ChromaFormatterName(),
+			"syntax_hl_style":       "monokai",
+			"syntax_hl_override_bg": "true",
+			"sslmode":               sslmode,
+			"term_graphics":         "none",
+			"encoding":              feed.UTF8,
 		},
 		prnt: map[string]string{
 			"border":                   "1",
@@ -107,6 +129,8 @@ func NewDefaultVars() *Variables {
 			"fieldsep_zero":            "off",
 			"footer":                   "on",
 			"format":                   "aligned",
+			"header_align":             "center",
+			"json_indent":              "0",
 			"linestyle":                "ascii",
 			"locale":                   locale,
 			"null":                     "",
@@ -123,9 +147,49 @@ func NewDefaultVars() *Variables {
 			"unicode_border_linestyle": "single",
 			"unicode_column_linestyle": "single",
 			"unicode_header_linestyle": "single",
+			"xheader_width":            "full",
 		},
-		conn: make(map[string][]string),
+		conn:     make(map[string][]string),
+		charts:   map[string]string{"path": "charts"},
+		env:      make(map[string]string),
+		envUnset: make(map[string]bool),
+		aliases:  make(map[string]string),
 	}
+}
+
+// ApplyEnviron sets the settings that the variables of usql's own
+// environment give, such as USQL_PAGER. They apply after the configuration
+// file and before the command line. A setting that a variable cannot take is
+// an error, and the other variables still apply.
+func (v *Variables) ApplyEnviron() error {
+	var errs []error
+	for _, s := range []struct {
+		env, name string
+	}{
+		{"SHOW_HOST_INFORMATION", "show_host_information"},
+		{"PAGER", "pager"},
+		{"EDITOR", "editor"},
+		{"SSLMODE", "sslmode"},
+	} {
+		value, ok := Getenv(text.CommandUpper() + "_" + s.env)
+		if !ok || s.name == "show_host_information" && value == "" {
+			continue
+		}
+		prev := v.uset[s.name]
+		if err := v.SetSetting(s.name, value); err != nil {
+			errs = append(errs, fmt.Errorf("%s_%s: %w", text.CommandUpper(), s.env, err))
+			continue
+		}
+		// the pager is on when there is a pager to run, as it is for PAGER
+		switch {
+		case s.name != "pager":
+		case value == "":
+			v.prnt["pager"] = "off"
+		case prev == "" && v.prnt["pager"] == "off":
+			v.prnt["pager"] = "on"
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Vars returns a copy of the standard variables.
@@ -149,21 +213,14 @@ func (v *Variables) Get(name string) (string, bool) {
 	return value, ok
 }
 
-// Set sets a standard variable.
+// Set sets a standard variable. A setting of the application is not a
+// variable, and is set with SetSetting.
 func (v *Variables) Set(name, value string) error {
 	if err := ValidIdentifier(name); err != nil {
 		return err
 	}
-	switch name {
-	case "ON_ERROR_STOP", "QUIET":
-		if value == "" {
-			value = "on"
-		} else {
-			var err error
-			if value, err = ParseBool(value, name); err != nil {
-				return err
-			}
-		}
+	if _, ok := v.uset[name]; ok {
+		return fmt.Errorf(text.IsASetting, name, text.CommandName, name)
 	}
 	v.vars[name] = value
 	return nil
@@ -174,9 +231,91 @@ func (v *Variables) Unset(name string) error {
 	if err := ValidIdentifier(name); err != nil {
 		return err
 	}
+	if _, ok := v.uset[name]; ok {
+		return fmt.Errorf(text.IsASetting, name, text.CommandName, name)
+	}
 	delete(v.vars, name)
 	return nil
 }
+
+// Setting returns a setting of the application.
+func (v *Variables) Setting(name string) (string, bool) {
+	value, ok := v.uset[name]
+	return value, ok
+}
+
+// Settings returns a copy of the settings of the application.
+func (v *Variables) Settings() map[string]string {
+	return maps.Clone(v.uset)
+}
+
+// SetSetting sets a setting of the application, which must exist, and reads
+// the value as the setting takes it: on or off for a switch, and any text for
+// the others.
+func (v *Variables) SetSetting(name, value string) error {
+	if _, ok := v.uset[name]; !ok {
+		return fmt.Errorf(text.UnknownSetting, name)
+	}
+	switch name {
+	case "on_error_stop", "quiet":
+		if value == "" {
+			value = "on"
+		} else {
+			var err error
+			if value, err = ParseBool(value, name); err != nil {
+				return err
+			}
+		}
+	case "echo_hidden":
+		if value == "" {
+			value = "on"
+		} else {
+			var err error
+			if value, err = ParseKeywordBool(value, name, "noexec"); err != nil {
+				return err
+			}
+		}
+	case "fetch_count":
+		// psql's FETCH_COUNT: 0 shows a result at once, and a number shows
+		// it in groups of that many rows
+		if value == "" {
+			value = "0"
+		}
+		i, err := strconv.Atoi(value)
+		if err != nil || i < 0 {
+			return fmt.Errorf(text.FormatFieldInvalidValue, value, name, "a number of rows")
+		}
+		value = strconv.Itoa(i)
+	case "encoding":
+		var err error
+		if value, err = feed.Encoding(value); err != nil {
+			return err
+		}
+	case "syntax_hl_style":
+		if _, ok := styles.Get(value); !ok {
+			return fmt.Errorf(text.UnknownStyle, value)
+		}
+	case "syntax_hl_format":
+		if !slices.Contains(syntaxFormats, value) {
+			return fmt.Errorf(text.UnknownFormatter, value, strings.Join(syntaxFormats, ", "))
+		}
+	case "show_host_information", "syntax_hl", "syntax_hl_override_bg":
+		b, err := ParseBool(value, name)
+		if err != nil {
+			return err
+		}
+		value = "false"
+		if b == "on" {
+			value = "true"
+		}
+	}
+	v.uset[name] = value
+	return nil
+}
+
+// syntaxFormats are the values of syntax_hl_format. They are the names of the
+// formatters of Chroma, which usql used before, and each one names a color depth.
+var syntaxFormats = []string{"noop", "terminal", "terminal256", "terminal16m"}
 
 // Dump dumps the standard variables to w.
 func (v *Variables) Dump(w io.Writer) error {
@@ -186,12 +325,51 @@ func (v *Variables) Dump(w io.Writer) error {
 	return nil
 }
 
-// GetPrint returns a print variable.
-func (v *Variables) GetPrint(name string) (string, error) {
-	if val, ok := v.prnt[name]; ok {
-		return val, nil
+// DumpSettings dumps the settings of the application to w, as a table of names
+// and values, as DumpPrint does.
+func (v *Variables) DumpSettings(w io.Writer) error {
+	width, keys := 0, maps.Keys(v.uset)
+	for k := range keys {
+		width = max(len(k), width)
 	}
-	return "", fmt.Errorf(text.UnknownFormatFieldName, name)
+	for _, k := range slices.Sorted(keys) {
+		fmt.Fprintf(w, "%-*s %s\n", width, k, v.settingText(k))
+	}
+	return nil
+}
+
+// DumpPrint dumps the print variables to w.
+func (v *Variables) DumpPrint(w io.Writer) error {
+	width, keys := 0, maps.Keys(v.prnt)
+	for k := range keys {
+		width = max(len(k), width)
+	}
+	for _, k := range slices.Sorted(keys) {
+		fmt.Fprintf(w, "%-*s %s\n", width, k, v.printText(k))
+	}
+	return nil
+}
+
+// DumpConn dumps the connection variables to w, as a table of names and
+// values, as DumpPrint does. The password of a URL is written as xxxxx, as
+// \conninfo writes it.
+func (v *Variables) DumpConn(w io.Writer) error {
+	return v.dump(w, false, false, SectionConnections)
+}
+
+// SettingText returns the value of a setting as it is shown: text that can
+// hold spaces is quoted.
+func (v *Variables) SettingText(name string) string {
+	return v.settingText(name)
+}
+
+func (v *Variables) settingText(name string) string {
+	val := v.uset[name]
+	switch name {
+	case "editor", "pager", "prompt1", "prompt2":
+		return strconv.QuoteToASCII(val)
+	}
+	return val
 }
 
 // SetPrint sets a print variable.
@@ -203,6 +381,18 @@ func (v *Variables) SetPrint(name, value string) (string, error) {
 	case "border", "columns", "pager_min_lines":
 		i, _ := strconv.Atoi(value)
 		v.prnt[name] = fmt.Sprintf("%d", i)
+	case "json_indent":
+		// on is two spaces, off is compact, and a number is that many spaces
+		switch i, err := strconv.Atoi(value); {
+		case value == "on":
+			v.prnt[name] = "2"
+		case value == "off":
+			v.prnt[name] = "0"
+		case err != nil || i < 0:
+			return "", fmt.Errorf(text.FormatFieldInvalidValue, value, name, "a number of spaces, on or off")
+		default:
+			v.prnt[name] = strconv.Itoa(i)
+		}
 	case "pager":
 		s, err := ParseKeywordBool(value, name, "always")
 		if err != nil {
@@ -226,6 +416,14 @@ func (v *Variables) SetPrint(name, value string) (string, error) {
 			return "", text.ErrInvalidFormatType
 		}
 		v.prnt[name] = value
+	case "header_align":
+		// psql centers the names of the columns, and has no such variable
+		switch value {
+		case "center", "left", "right", "column":
+			v.prnt[name] = value
+		default:
+			return "", fmt.Errorf(text.FormatFieldInvalidValue, value, name, "center, left, right or column")
+		}
 	case "linestyle":
 		if !linestlyeRE.MatchString(value) {
 			return "", text.ErrInvalidFormatLineStyle
@@ -243,10 +441,50 @@ func (v *Variables) SetPrint(name, value string) (string, error) {
 			return "", text.ErrInvalidFormatBorderLineStyle
 		}
 		v.prnt[name] = value
+	case "xheader_width":
+		s, err := XheaderWidth(value)
+		if err != nil {
+			return "", err
+		}
+		v.prnt[name] = s
 	default:
 		panic(fmt.Sprintf("field %s was defined in the print variables, but not in switch", name))
 	}
 	return v.prnt[name], nil
+}
+
+// XheaderWidth reads a value of xheader_width as psql reads it: full, column
+// and page in any case, or else the number that the value starts with, as
+// atoi in C reads it. tblfmt reads it the same way. A negative number is kept,
+// and tblfmt writes it as full. Zero, or a value with no number, is an error.
+func XheaderWidth(value string) (string, error) {
+	for _, word := range []string{"full", "column", "page"} {
+		if strings.EqualFold(value, word) {
+			return word, nil
+		}
+	}
+	if n := atoi(value); n != 0 {
+		return strconv.Itoa(n), nil
+	}
+	return "", text.ErrInvalidXheaderWidth
+}
+
+// atoi returns the number that s starts with, after any white space, or 0, as
+// atoi in C does.
+func atoi(s string) int {
+	s = strings.TrimLeft(s, " \t\n\v\f\r")
+	neg := false
+	if s != "" && (s[0] == '-' || s[0] == '+') {
+		neg, s = s[0] == '-', s[1:]
+	}
+	n := 0
+	for i := 0; i < len(s) && '0' <= s[i] && s[i] <= '9' && n < math.MaxInt32; i++ {
+		n = n*10 + int(s[i]-'0')
+	}
+	if neg {
+		return -n
+	}
+	return n
 }
 
 // TogglePrint toggles a print variable.
@@ -256,6 +494,12 @@ func (v *Variables) TogglePrint(name, extra string) (string, error) {
 	}
 	switch name {
 	case "border", "columns", "pager_min_lines":
+	case "json_indent":
+		if v.prnt[name] == "0" {
+			v.prnt[name] = "2"
+		} else {
+			v.prnt[name] = "0"
+		}
 	case "pager":
 		switch v.prnt[name] {
 		case "on", "always":
@@ -292,37 +536,51 @@ func (v *Variables) TogglePrint(name, extra string) (string, error) {
 		default:
 			v.prnt[name] = "aligned"
 		}
-	case "linestyle":
+	case "linestyle", "header_align":
 	case "csv_fieldsep", "fieldsep", "null", "recordsep", "time", "timezone", "locale":
 	case "tableattr", "title":
 		v.prnt[name] = ""
 	case "unicode_border_linestyle", "unicode_column_linestyle", "unicode_header_linestyle":
+	case "xheader_width":
 	default:
 		panic(fmt.Sprintf("field %s was defined in the print variables, but not in switch", name))
 	}
 	return v.prnt[name], nil
 }
 
-// DumpPrint dumps the print variables to w.
-func (v *Variables) DumpPrint(w io.Writer) error {
-	width, keys := 0, maps.Keys(v.prnt)
-	for k := range keys {
-		width = max(len(k), width)
-	}
-	for _, k := range slices.Sorted(keys) {
-		val := v.prnt[k]
-		switch k {
-		case "csv_fieldsep", "fieldsep", "recordsep", "null":
-			val = strconv.QuoteToASCII(val)
-		case "tableattr", "title":
-			if val != "" {
-				val = strconv.QuoteToASCII(val)
-			}
+// printText returns the value of a print setting as it is shown: a separator
+// and a text that is set are quoted.
+func (v *Variables) printText(name string) string {
+	val := v.prnt[name]
+	switch name {
+	case "csv_fieldsep", "fieldsep", "recordsep", "null":
+		return strconv.QuoteToASCII(val)
+	case "tableattr", "title":
+		if val != "" {
+			return strconv.QuoteToASCII(val)
 		}
-		fmt.Fprintf(w, "%-*s %s\n", width, k, val)
-		// k+strings.Repeat(" ", width-len(k)), val)
 	}
-	return nil
+	return val
+}
+
+// JSONIndent returns the indent of JSON output that the print variables in
+// params set: json_indent spaces, or nothing for compact output.
+func JSONIndent(params map[string]string) string {
+	n, _ := strconv.Atoi(params["json_indent"])
+	return strings.Repeat(" ", max(n, 0))
+}
+
+// BlankLineAfter reports whether a table in the output format of params is
+// followed by an empty line. psql writes one after the aligned and wrapped
+// formats, and after no other. usql writes one after a markdown table too,
+// which psql does not have, because a line that follows a markdown table
+// becomes one of its rows.
+func BlankLineAfter(params map[string]string) bool {
+	switch params["format"] {
+	case "aligned", "wrapped", "markdown":
+		return true
+	}
+	return false
 }
 
 // PrintTimeFormat returns the user's time format converted to Go's time.Format
@@ -337,9 +595,11 @@ func (v *Variables) PrintTimeFormat() string {
 
 // SetConn sets a named connection variable.
 func (v *Variables) SetConn(name string, vals ...string) error {
-	if err := ValidIdentifier(name); err != nil {
+	// Connection names accept hyphens so existing CLI profile names remain unchanged.
+	if err := ValidIdentifier(strings.ReplaceAll(name, "-", "_")); err != nil {
 		return err
 	}
+	// Empty values remove an existing profile; non-empty values replace it with an isolated copy.
 	if _, ok := v.conn[name]; len(vals) == 0 || vals[0] == "" && ok {
 		delete(v.conn, name)
 	} else {
@@ -355,14 +615,6 @@ func (v *Variables) GetConn(name string) ([]string, bool) {
 		return nil, false
 	}
 	return slices.Clone(vals), true
-}
-
-// DumpConn dumps the connection variables to w.
-func (v *Variables) DumpConn(w io.Writer) error {
-	for _, k := range slices.Sorted(maps.Keys(v.conn)) {
-		fmt.Fprintln(w, k, "=", Quote(strings.Join(v.conn[k], " ")))
-	}
-	return nil
 }
 
 // timeConsts are well known time consts.

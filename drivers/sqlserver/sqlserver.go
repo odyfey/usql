@@ -1,21 +1,17 @@
 // Package sqlserver defines and registers usql's Microsoft SQL Server driver.
 //
 // See: https://github.com/microsoft/go-mssqldb
-// Group: base
 package sqlserver
 
 import (
-	"context"
 	"database/sql"
+	"errors"
 	"fmt"
-	"io"
 	"strconv"
 	"strings"
 
-	mssql "github.com/microsoft/go-mssqldb"
 	sqlserver "github.com/microsoft/go-mssqldb" // DRIVER
 	"github.com/xo/usql/drivers"
-	"github.com/xo/usql/drivers/metadata"
 
 	// needed for azuresql authentication, named pipes, and shared memory transport protocols
 	_ "github.com/microsoft/go-mssqldb/azuread"
@@ -25,9 +21,6 @@ import (
 
 func init() {
 	drivers.Register("sqlserver", drivers.Driver{
-		AllowMultilineComments:  true,
-		RequirePreviousPassword: true,
-		LexerName:               "tsql",
 		/*
 			// NOTE: this has been commented out, as it is not necessary. if
 			// NOTE: the azuread.DriverName is changed from `azuresql`, then
@@ -46,28 +39,20 @@ func init() {
 				}, nil
 			},
 		*/
-		Version: func(ctx context.Context, db drivers.DB) (string, error) {
-			var ver, level, edition string
-			err := db.QueryRowContext(
-				ctx,
-				`SELECT SERVERPROPERTY('productversion'), SERVERPROPERTY ('productlevel'), SERVERPROPERTY ('edition')`,
-			).Scan(&ver, &level, &edition)
-			if err != nil {
-				return "", err
-			}
-			return "Microsoft SQL Server " + ver + ", " + level + ", " + edition, nil
-		},
-		ChangePassword: func(db drivers.DB, user, newpw, oldpw string) error {
-			_, err := db.Exec(`ALTER LOGIN ` + user + ` WITH password = '` + newpw + `' old_password = '` + oldpw + `'`)
-			return err
-		},
 		ColumnTypes: func(col *sql.ColumnType) (interface{}, error) {
 			switch col.DatabaseTypeName() {
 			case "UNIQUEIDENTIFIER":
 				if nullable, ok := col.Nullable(); ok && nullable {
-					return new(NullUniqueIdentifier), nil
+					return new(sql.Null[uniqueIdentifier]), nil
 				}
-				return new(mssql.UniqueIdentifier), nil
+				return new(uniqueIdentifier), nil
+			case "REAL":
+				// go-mssqldb widens a real to a float64, which then prints
+				// 4.9 as 4.900000095367432, and a float32 prints as sqlcmd does
+				if nullable, ok := col.Nullable(); ok && nullable {
+					return new(sql.Null[float32]), nil
+				}
+				return new(float32), nil
 			}
 			return new(interface{}), nil
 		},
@@ -75,47 +60,50 @@ func init() {
 			if e, ok := err.(sqlserver.Error); ok {
 				return strconv.Itoa(int(e.Number)), e.Message
 			}
-			msg := err.Error()
-			if i := strings.LastIndex(msg, "sqlserver:"); i != -1 {
-				msg = msg[i:]
+			return "", err.Error()
+		},
+		// psql's layout, with the number of the error as the code. The level,
+		// the state and the server go in DETAIL, the procedure and the line
+		// in CONTEXT, and each other error of the batch in its own DETAIL.
+		ErrVerbose: func(err error, _ string) string {
+			var e sqlserver.Error
+			if !errors.As(err, &e) {
+				return ""
 			}
-			return "", msg
+			all := e.All
+			if len(all) == 0 {
+				all = []sqlserver.Error{e}
+			}
+			first := all[0]
+			detail := fmt.Sprintf("level %d, state %d", first.Class, first.State)
+			if first.ServerName != "" {
+				detail += ", server " + first.ServerName
+			}
+			context := fmt.Sprintf("line %d", first.LineNo)
+			if first.ProcName != "" {
+				context = "procedure " + first.ProcName + ", " + context
+			}
+			fields := [][2]string{{"DETAIL", detail}, {"CONTEXT", context}}
+			for _, m := range all[1:] {
+				fields = append(fields, [2]string{"DETAIL", fmt.Sprintf("%d: %s", m.Number, m.Message)})
+			}
+			return drivers.Verbose(strconv.Itoa(int(first.Number)), first.Message, fields...)
 		},
 		IsPasswordErr: func(err error) bool {
 			return strings.Contains(err.Error(), "Login failed for")
 		},
-		NewMetadataReader: NewReader,
-		NewMetadataWriter: func(db drivers.DB, w io.Writer, opts ...metadata.ReaderOption) metadata.Writer {
-			return metadata.NewDefaultWriter(NewReader(db, opts...))(db, w)
-		},
-		Copy: drivers.CopyWithInsert(placeholder),
 	})
 }
 
-func placeholder(n int) string {
-	return fmt.Sprintf("@p%d", n)
+// uniqueIdentifier is a uniqueidentifier of SQL Server that prints as a uuid of
+// PostgreSQL does, in lower case, so that a column of UUIDs prints the same on
+// both. go-mssqldb's UniqueIdentifier reads the bytes in the order that SQL
+// Server stores them, and prints in upper case, as SQL Server's tools do.
+type uniqueIdentifier struct {
+	sqlserver.UniqueIdentifier
 }
 
-type NullUniqueIdentifier struct {
-	ID    mssql.UniqueIdentifier
-	Valid bool
-}
-
-func (nui *NullUniqueIdentifier) Scan(v interface{}) error {
-	nui.Valid = false
-	if v == nil {
-		return nil
-	}
-	if err := nui.ID.Scan(v); err != nil {
-		return err
-	}
-	nui.Valid = true
-	return nil
-}
-
-func (nui NullUniqueIdentifier) String() string {
-	if nui.Valid {
-		return nui.ID.String()
-	}
-	return ""
+// String satisfies the fmt.Stringer interface, which tblfmt prints.
+func (u uniqueIdentifier) String() string {
+	return strings.ToLower(u.UniqueIdentifier.String())
 }

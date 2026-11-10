@@ -1,69 +1,516 @@
-Contributing to usql
-====================
+# Contributing to usql
 
-Any contributions are welcome. If you found a bug, or a missing feature,
-take a look at existing [issues](https://github.com/xo/usql/issues)
-and create a new one if needed.
-
-You can also open up a [pull request](https://github.com/xo/usql/pulls) (PR)
-with code or documentation changes.
+Report a bug, ask a question, or propose a feature in
+[Discussions](https://github.com/xo/usql/discussions). The repository takes
+no issues and no pull requests.
 
 # Adding a new driver
 
-1. Add a new schema in [dburl](https://github.com/xo/dburl).
-1. Create a new go package in `drivers`. It should have an `init()` function, that would call `drivers.Register()`.
-1. Regenerate code in the `internal` package by running `internal/gen.sh`.
-1. Add any new required modules using `go get` or by editing `go.mod` manually and running `go mod tidy`.
-1. Run all tests, build `usql` and see if the new driver works.
-1. Update `README.md`.
+The full procedure is in [docs/DRIVER.md](docs/DRIVER.md). Read it before you
+start, because two of the steps happen in a different repository and one of
+them must happen first.
 
-> Tip: check out closed PRs for examples, and/or search the codebase
-for names of databases you're familiar with.
+The short version:
 
-# Enabling metadata introspection for a driver
+1. Answer the pre-flight questions. Is the upstream driver maintained, does it
+   touch global process state, what does it link, can it be tested, and is it
+   worth the wrapper it needs?
+2. Add the scheme in [dburl](https://github.com/xo/dburl).
+3. Add the build tag to `plainDrivers` in `gen.go`. Only a driver that needs a
+   hook, such as `Err` or `Version`, gets a package in `drivers`, with an
+   `init()` that calls `drivers.Register()`.
+4. Regenerate the `internal` package, the driver tables in `README.md` and the
+   license files by running `go run gen.go`.
+5. Add the module with `go get`, then run `go mod tidy`.
+6. Write no metadata reader. usql reads all metadata from
+   [dbmeta](https://github.com/xo/dbmeta). If dbmeta has no model for the
+   database, the describe commands of the new driver report that they are not
+   supported. See D3 and D4.
+7. Verify against a live database. Compilation is not evidence, because nearly
+   every field of `drivers.Driver` is optional.
 
-For `\d*` commands to work, `usql` needs to know how to read the structure of a database.
-A driver must provide a metadata reader, by setting the `NewMetadataReader` property
-in the `drivers.Driver` structure passed to `drivers.Register()`. This needs to be a function
-that given a database and reader options, returns a reader instance for this particular driver.
+A driver that cannot compile everywhere says so with a build constraint: the
+`Build` field of its entry in `plainDrivers`, or a `Build:` line in the comment
+of its package. `gen.go` adds that constraint to the file it generates in
+`internal`. The duckdb driver uses `Build: "!(linux && arm)"`, because its
+prebuilt library has no 32 bit arm build.
 
-If the database has a `information_schema` schema, with standard tables like `tables` and `columns`,
-you can use an existing reader from the `drivers/informationschema` package.
-Since there are usually minor difference in objects defined in that schema in different databases,
-there's a set of options to configure this reader. Refer to
-the [package docs](https://pkg.go.dev/github.com/xo/usql/drivers/metadata/informationschema) for details.
+usql has one build. A build with no tags has every driver. The tag `no_<tag>`
+leaves one driver out, and `no_drivers` leaves out every driver that the build
+does not name by its tag.
 
-If you can't use the `informationschema` reader, consider implementing a new one.
-It should implement at least one of the following reader interfaces:
-* CatalogReader
-* SchemaReader
-* TableReader
-* ColumnReader
-* IndexReader
-* IndexColumnReader
-* FunctionReader
-* FunctionColumnReader
-* SequenceReader
+## Building duckdb on Windows
 
-Every of these interfaces consist of a single function, that takes a `Filter` structure as an argument,
-and returns a set of results and an error.
+The duckdb driver links prebuilt static archives rather than building DuckDB
+from source, and the archives are built by MinGW-Builds GCC 14.2.0 for x86_64,
+UCRT, posix-seh. Linking needs a toolchain that matches all three, and two out
+of three is not enough:
 
-Example drivers using their own readers include:
-* `sqlite3`
-* `oracle` and `godror` sharing the same reader
+- An MSVCRT gcc, which is the MSYS2 MINGW64 environment, fails on
+  `__stdio_common_vsnprintf_s` and other `__stdio_common_*` symbols. Those are
+  UCRT functions, so the runtime is wrong.
+- A newer UCRT gcc, which is the MSYS2 UCRT64 environment today, gets past the
+  runtime and fails on `__emutls_v._ZSt11__once_call`. The archives were built
+  by a GCC whose libstdc++ used emulated TLS for that, and a newer one does
+  not. The version is wrong.
 
-If you want to use the `informationschema` reader, but need to override one or more readers,
-use the `metadata.NewPluginReader(readers ...Reader)` function. It returns an object calling
-reader functions from the last reader passed in the arguments, that implements it.
+Install the matching toolchain and put it first on PATH:
 
-Example drivers extending an `informationschema` reader using a plugin reader:
-* `postgres`
+    winget install --id BrechtSanders.WinLibs.POSIX.UCRT.LLVM --exact --silent
 
-`\d*` commands are actually implemented by a metadata writer. There's currently only one,
-but it too can be replaced and/or extended.
+It lands under `%LOCALAPPDATA%\Microsoft\WinGet\Packages\` in a
+`mingw64\bin` directory. `go build` finds `gcc` there and turns CGO on by
+itself. The workflows install the same package for the same reason.
 
-# Enabling autocomplete for a driver
+Checking that `go build github.com/duckdb/duckdb-go/v2` succeeds is not
+enough. Building a package compiles it. The archives are only linked when an
+executable is produced, so every failure above appears at the binary link and
+not before. Build the binary.
 
-If a driver provides a metadata reader, the default completer will use it.
-A driver can provide it's own completer, by setting the `NewCompleter` property
-in the `drivers.Driver` structure passed to `drivers.Register()`.
+## Adding a platform constraint to a driver
+
+Put the constraint in the `Build` field of the driver's entry in
+`plainDrivers`, or in the driver's package comment, rather than in `build.sh`.
+A constraint in the generated file also excludes the driver from a plain
+`go build`, while one in the script only applies to a build made through the
+script.
+
+> Tip: for examples, read the history of the repository, or search the code
+> for the name of a database that you know.
+
+## When a driver is broken, and what to do about it
+
+Read this before adding a driver, and before deciding a reported fault is
+usql's. It is written for anyone working on the tree, including coding agents,
+because the judgement it describes is easy to get wrong in the direction of
+keeping something that has to go.
+
+usql links more than fifty drivers into one process. A driver is therefore
+not judged on whether it works on its own. It is judged on whether it can share
+a process with all the others and with a command line tool whose standard
+output is the data.
+
+### What makes a driver unfit
+
+usql has one build, and every driver is in it. There is no group that keeps a
+driver in the tree and out of the build. A driver with any of these faults is
+fixed upstream first, or removed. Each is detectable rather than a matter of
+taste. Run the detection against the whole module, not only the driver
+package, because the fault is usually several levels down a transitive import.
+
+Mutating process-global state from `init`. That covers the standard logger, the
+default slog logger, `os.Stdout` and `os.Stderr`, signal handling,
+`flag.CommandLine`, `http.DefaultClient` and `http.DefaultTransport`,
+`runtime.GOMAXPROCS`, `time.Local`, `math/rand` seeding, and any crypto or TLS
+default. To find it:
+
+    go list -deps -f '{{.Dir}}' <driver import path> | while read d; do
+      grep -nE 'slog\.SetDefault|log\.SetOutput|os\.(Stdout|Stderr) *=|signal\.Notify|flag\.CommandLine|http\.Default(Client|Transport)|runtime\.GOMAXPROCS|time\.Local *=|rand\.Seed' "$d"/*.go 2>/dev/null
+    done
+
+Writing to standard output uninvited. Stdout carries the query results and is
+usually piped or redirected, so anything a driver prints there corrupts the
+output of the program rather than merely appearing in the wrong place. A test
+that replaces `os.Stdout` with a pipe, imports the driver and asserts nothing
+arrives catches it.
+
+Doing work in `init` that must not happen at import: dialling the network,
+reading files, sleeping, spawning a goroutine that outlives the call, or simply
+taking a long time. `GODEBUG=inittrace=1` reports the cost of every package's
+init.
+
+Exiting the process instead of returning an error. `os.Exit`, `log.Fatal` or a
+panic on an operational failure such as a bad DSN, a refused connection or a
+query error.
+
+Registering a `database/sql` name that another driver already uses, which
+panics at init and takes the whole binary with it.
+
+Needing cgo, shipping prebuilt object files, or linking on only some of the
+platforms usql releases for. That is not automatically disqualifying, because
+duckdb and sqlite3 both need cgo. A driver that cannot build on a release
+target needs a build constraint as well. See the section above.
+
+Module hygiene that breaks consumers. An `exclude` or `replace` directive in
+its own `go.mod`, a missing `go.mod`, or a `+incompatible` version that will
+not resolve. Confirm with a real install rather than reasoning about it:
+
+    cd $(mktemp -d) && go install github.com/xo/usql@latest
+
+A licence that is not compatible with usql's, or a size cost out of all
+proportion to what the driver offers.
+
+### Remove it
+
+Remove the driver when it has a fault above that upstream does not fix, or when
+upstream has stopped. The signals are concrete. The repository is archived.
+There is no release or commit for eighteen months. A security report goes
+unanswered. The module no longer resolves. Nobody replies.
+
+Removing means the entry in `plainDrivers` or the driver directory, the
+generated file in `internal`, the dependency in `go.mod`, and the README row.
+`go run gen.go` removes the generated file and the README row. `go mod tidy`
+removes the dependency. The scheme is then dropped from dburl.
+
+The bar for keeping an unmaintained driver is not that someone could use it. It
+is whether usql can carry it without cost to everyone else. A driver that is both
+unmaintained and badly behaved does not get parked. It gets dropped.
+
+### What has actually happened
+
+usql once had build groups. A `bad` group held the drivers that were known to
+be broken, out of every build that did not ask for them. It was created in
+August 2022 to hold impala. hive was demoted a month later, briefly re-enabled
+in November 2023, and put straight back the same day. genji went in during July
+2023 and left in January 2024 by being replaced with chai. impala came back in
+April 2025, three years after it went in. In November 2026 the groups were
+removed, and the last two drivers in `bad`, h2 and gizmosql, were removed with
+them.
+
+Removed outright, at various times: YQL in 2017, avatica in 2017, snowflake in
+2024, dameng in September 2026, RamSQL in September 2026, and h2 and gizmosql
+in November 2026. avatica and snowflake later returned, which is the other half
+of the point: removal is not a judgement on the database, only on the driver as
+it stands.
+
+RamSQL is the case this section was written from. Its `engine/log` called
+`slog.SetDefault` from `init` with a handler on `os.Stdout`. A default slog
+logger also redirects the standard `log` package, so every `log.Print` and
+`slog` call in any build that carried it disappeared, and anything that had
+been printed would have landed in the query output. It offered no way to turn
+that off: the only exported control was a level threshold, the writer was fixed
+at construction, and raising the level discarded more rather than less. It was
+two years without a release, and `sqlite3://:memory:` and the pure-Go
+`moderncsqlite` already covered everything it was used for. A workaround was
+written in `package main` and then reverted, because it fixed the binary and
+left usql's packages, and anyone importing them, still broken. The driver was
+removed instead.
+
+## Measuring the size of a driver
+
+`size.sh` measures how much each driver adds to the usql binary. It builds
+usql once with every driver, and once more for each driver with only that
+driver left out, through its `no_<tag>` build tag. The difference is what
+removing that driver saves. It measures the charts feature in the same way.
+The builds are stripped, as `build.sh` strips a release.
+
+    ./size.sh
+
+Two drivers that share a module each save only what the other does not use.
+So the savings do not add up to the size of the binary.
+
+The run takes one build for each driver. W32 in `docs/BACKLOG.md` holds the
+last measurement, and when to measure again.
+
+## Regenerating the examples of the README
+
+`gen.go` fills each code block of `README.md` that has an `<!-- EXAMPLE name -->`
+marker on the line above it with what usql prints. The examples are in
+`internal/readme/examples.go`. Edit them there, and never in the README.
+
+The examples that need a database run against SQL Server, with the fixture
+`examples` of dbmeta's `dbrun`: the tables `authors` and `books`. `gen.go`
+loads the fixture and reads the URL itself, but it does not start a server.
+Check out dbmeta next to usql, start the server, and then regenerate:
+
+    (cd ../dbmeta/test && DBMETA_OWNER_NAME=usql go run ./cmd/dbrun start sqlserver-2025)
+    go run gen.go -examples
+
+For the describe commands, dbmeta's fixture `northwind` builds Microsoft's
+Northwind on PostgreSQL, MySQL, MariaDB, SQL Server, Oracle 12.2 or later,
+Firebird, SAP HANA, SQLite and DuckDB. On PostgreSQL, SQL Server and Oracle it
+also builds a schema `hr` of views, functions, triggers, types and partitions.
+On Oracle, the schemas are the users `northwind` and `hr`. dbrun loads the
+fixture with the `usql` on your PATH, so build usql first:
+
+    (cd ../dbmeta/test && DBMETA_OWNER_NAME=usql go run ./cmd/dbrun fixture northwind postgres-18)
+
+The run builds usql with every driver and types each example into it
+under a pseudo-terminal, which takes about a minute. The README shows `pass` for
+the password and `localhost` for the host and port.
+
+To compare the examples on another base database, name its `dbrun` selector,
+and write the blocks to a directory. The README is left as it is:
+
+    go run gen.go -examples -examples-db oracle-26ai -examples-out /tmp/oracle
+
+The selectors are `postgres-18`, `mysql-26.7`, `mariadb-13.0`,
+`sqlserver-2025`, `oracle-26ai`, `sqlite3` and `duckdb`. Stop each server that
+you started when you finish.
+
+## Putting a feature behind a build tag
+
+A package that is not a driver can still be a large part of the size of the
+binary. The charts renderer is one: it runs Apache ECharts in a JavaScript
+engine and rasterizes the result with an SVG renderer, which together add about
+12 MiB to every binary they are linked into.
+
+The only way to leave such a package out is a build tag that reaches the import
+itself, so these are gated the same way the drivers are. Add an entry to the
+`features` list in `gen.go`:
+
+```go
+{
+    Tag:  "charts",
+    Pkg:  "github.com/xo/usql/metacmd/charts/echarts",
+    Desc: "ECharts chart renderer",
+}
+```
+
+`gen.go` then writes `internal/charts.go`, which imports that package under the
+same constraint as a driver's. A build includes the feature, `no_charts` leaves
+it out, and `no_drivers` leaves it out unless the build also names `charts`.
+`Build` works as it does for a driver, so a feature that cannot compile
+everywhere states so there.
+
+A feature is not a driver. It registers no URL scheme, and it does not appear in
+`internal.KnownBuildTags` or in the driver table in the README.
+
+The rest of usql must not import the package directly. Give it a registry in a
+package that costs nothing, have the gated package register itself from its
+`init`, and have the caller ask the registry whether the feature is there. See
+`metacmd/charts/renderer.go` for the registry and
+`metacmd/charts/echarts/echarts.go` for the implementation. Without that, the
+import in the caller links the package back in and the tag does nothing.
+
+Run `go run gen.go` after editing `gen.go`. It reads dburl from the version
+pinned in `go.mod`.
+
+# Running the tests
+
+Every test runs without a database, wherever usql builds:
+
+    go test ./...
+
+On a machine with little memory, run one package at a time with `-p 1`.
+
+## Fuzz tests
+
+The fuzz tests of `feed` read scripts the way `-f` does, in the syntax of
+every dialect that dbmeta has a model for. They put quotes, separators,
+backslashes and unusual Unicode into names, strings and comments. They save
+scripts in encodings other than UTF-8 and read them with the `encoding`
+setting, and check that a script that is not valid UTF-8 is refused.
+`go test ./...` runs only their seed inputs. To search for new inputs, run one
+fuzz test at a time:
+
+    go test -run '^$' -fuzz FuzzSplit ./feed
+    go test -run '^$' -fuzz FuzzQuotedNames ./feed
+    go test -run '^$' -fuzz FuzzEncodings ./feed
+
+A fuzz test stops at the first input that fails and writes it under
+`feed/testdata/fuzz`. Commit that file with the fix, so that `go test ./...`
+runs it from then on.
+
+No test of usql starts a database. A test that needs one skips when the
+environment names none. [Tests against a database](#tests-against-a-database)
+says how to start one with dbmeta's `dbrun`, which owns every container setup.
+
+## Terminal tests
+
+usql turns off its prompt, line editor, completion and colour when it does not
+own a terminal, so piping input into it exercises none of them. `cli_test.go`
+records sessions against a real pseudo-terminal and compares them against the
+golden transcripts in `testdata/cli`:
+
+    go test -tags "sqlite3 no_drivers" -run TestCLI .
+
+Every session uses SQLite, so none of them needs a container. Linux and macOS
+record. Windows has no pseudo-terminal device file, so the test skips there.
+
+Re-record after a deliberate change to the output:
+
+    go test -tags "sqlite3 no_drivers" -run TestCLI -update .
+
+Read the diff before you keep a re-recording. A golden here records what usql
+does rather than what it ought to do, so accepting one blindly freezes whatever
+it does now, including a bug. Before trusting a new golden, break the code it
+covers on purpose and make sure that the golden fails. A break that does not
+fail it means the golden covers nothing.
+
+## Command line tests
+
+The container definitions live in [dbmeta](https://github.com/xo/dbmeta), and
+its `dbrun` command starts them. [dbmeta's DBRUN.md][dbrun] covers its commands
+and the rules for sharing a machine. It runs from a dbmeta checkout, because
+the test module there has a replace directive:
+
+    git clone https://github.com/xo/dbmeta
+    cd dbmeta/test
+    go run ./cmd/dbrun start postgres-18
+
+If you are a coding agent, set `DBMETA_OWNER_NAME=usql` on every `dbrun`
+command, as DBRUN.md asks. Then `dbrun status` shows which session owns each
+server.
+
+A bare product name starts the newest release, and `postgres-12` names one
+release. dbrun assigns each release its own host port, so read the URL from
+`dbrun dsn` rather than writing it down. A plain `dsn` prints two columns, so
+take the URL from the JSON form. To run the usql you just built against it,
+from a usql checkout with dbmeta cloned beside it:
+
+    ./usql -c 'select 1' "$(cd ../dbmeta/test && go run ./cmd/dbrun dsn --json postgres-18 | jq -r '.[0].url')"
+
+`dbrun usql postgres-18` also opens usql on the server, but it runs the `usql`
+on your PATH and passes no flags. `dbrun stop postgres-18` stops the container.
+
+Start and stop only the databases you are testing, and test on the newest
+release. dbrun limits how many servers run at once, and DBRUN.md gives the
+limit and the rules for a server that another session started.
+
+[dbrun]: https://github.com/xo/dbmeta/blob/main/docs/DBRUN.md
+
+## Tests against a database
+
+The tests in `drivers/dbrun_test.go` and `drivers/dump_test.go` run against a
+database that dbrun started. They read two variables:
+
+- `USQL_TEST_URL` is the URL of the database. It is the field `url` that
+  `dbrun dsn --json` prints. When it is not set, the tests skip.
+- `USQL_TEST_NAME` is the dbrun name of the database, such as `postgres-18`.
+  It names the recording.
+
+dbmeta's own tests read variables such as `DBMETA_POSTGRES`. These hold the
+connection string of the Go driver, which for MySQL and for an embedded
+database is not a URL. usql takes only URLs, so its tests read a URL of their
+own.
+
+There are four tests:
+
+- `TestConnect` connects and reads the version of the server. It needs no
+  fixture, so it runs on every database.
+- `TestDescribe` runs the describe commands on the tables `authors` and `books`
+  of dbrun's fixture `examples`. It compares what usql prints with the
+  recording in `drivers/testdata/dbrun/NAME.txt`. If there is no recording,
+  the commands run and the test skips the comparison.
+- `TestCopy` copies `books` with `\copy` into a new SQLite database, and from
+  there into a new table of the database under test. Each copy must arrive
+  whole.
+- `TestDump` loads the fixture of the dialect in `drivers/testdata/dump` into
+  a new database, dumps it with `--dump`, and loads the dump into another new
+  database. The two dumps must be the same text. It also loads a dump of
+  only the schema and then a dump of only the rows, and dumps to SQLite and
+  DuckDB and back, where the number of rows of each table must be the same.
+  It makes the databases `usql_dump_src` and others like it on the server,
+  and drops them at the end. It skips a database that usql cannot dump yet.
+  An object that dbmeta does not dump, and warns about, goes into
+  `drivers/testdata/dump/DIALECT-skipped.sql`, and its warning goes into
+  `knownSkipped` in `drivers/dump_test.go`. The subtest `skipped by dbmeta`
+  fails when dbmeta dumps the object. Then move the object into the fixture
+  of the dialect, and remove it from `knownSkipped`. No object is skipped
+  now.
+
+dbrun has the fixture `examples` for PostgreSQL, MySQL, MariaDB, SQL Server,
+Oracle, SQLite and DuckDB. On another database, `TestDescribe` and `TestCopy`
+skip. On a database that has a recording, they fail when the fixture is not
+there. On MySQL and MariaDB, dbrun puts the fixture in the database `examples`,
+and the tests connect to it when the URL names no database.
+
+To run the tests against PostgreSQL 18, from a usql checkout with dbmeta cloned
+beside it:
+
+    dbrun() { (cd ../dbmeta/test && go run ./cmd/dbrun "$@"); }
+    dbrun start postgres-18
+    dbrun fixture examples postgres-18
+    USQL_TEST_URL="$(dbrun dsn --json postgres-18 | jq -r '.[0].url')" \
+      USQL_TEST_NAME=postgres-18 \
+      go test -count=1 -v -run 'TestConnect|TestDescribe|TestCopy|TestDump' ./drivers
+    dbrun stop postgres-18
+
+SQLite and DuckDB need no `start`. For an embedded database, `dbrun fixture`
+runs the `usql` on your PATH to load the fixture, so build usql first.
+
+When `pg_dump` and `psql` are on the path for PostgreSQL, or `mysqldump` and
+`mysql` for MySQL, `TestDump` also compares with that tool. It loads a dump
+of the tool into one database and a dump of usql into another, and the tool
+must write the same dump of both. The lines of the tool's dump that are
+known to differ are in `drivers/testdata/dump/TOOL.known`, each with the
+reason. The comparison skips when the tool is missing, or cannot load its own
+dump, as `pg_dump` cannot for a server of a newer release.
+
+`TestDumpEmbedded` needs no server, and runs with the other tests. It dumps
+SQLite and DuckDB to themselves and to each other.
+
+If you change what the describe commands print, record the output again with
+`-update`, against each database that has a recording:
+
+    USQL_TEST_URL=... USQL_TEST_NAME=postgres-18 \
+      go test -count=1 -run TestDescribe ./drivers -update
+
+Read the diff before you keep it. A recording holds what usql prints today,
+and that is not yet what psql prints (W46). The test replaces the password,
+and the names that SQL Server makes up for a constraint, so a recording does
+not change from one run to the next.
+
+CI runs the same tests, in the workflow `test.yml`, on each push. It tests
+only the main databases: `postgres-18`, `sqlserver-2025`, `mysql-26.7`,
+`sqlite3` and `duckdb`, which the workflow names. Test every other database
+locally with dbrun, as above. dbrun is built from the release of dbmeta that
+`go.mod` pins.
+
+## Comparing PostgreSQL output with psql
+
+`internal/cmd/pgcompare` compares how psql and usql print every built-in type of
+PostgreSQL. It makes values of each type, some fixed and some random, and runs
+the same query through psql, through usql with pgx, and through usql with libpq.
+It compares the aligned, unaligned and CSV output, and it writes a report of each
+difference. It needs `psql` on your PATH and a PostgreSQL server that dbrun
+started, as above:
+
+    go build -o /tmp/usql .
+    go run ./internal/cmd/pgcompare -usql /tmp/usql -dsn "$(cd ../dbmeta/test && go run ./cmd/dbrun dsn --json postgres-18 | jq -r '.[0].url')"
+
+The command prints where its report is. `REPORT.md` holds the differences, and
+`results.tsv` holds one line for each type, format and driver. `-seed` sets the
+random values, so that a run can be made again, and `-types int4,bytea` limits a
+run to some types. W63 in `docs/BACKLOG.md` lists the differences that are known.
+Run it after a change to a PostgreSQL driver or to `drivers/pgwire/pgshared`, and
+after an update of tblfmt.
+
+`contrib/` keeps only the scripts that usql runs against a database and the
+client setup for a few drivers. A sample `config.yaml` and a sample `init.sql`
+are in `_samples/`.
+
+# Metadata introspection
+
+The `\d` family of commands, and the names that tab completion offers, read
+the structure of a database through [dbmeta](https://github.com/xo/dbmeta).
+`drivers.Meta` picks dbmeta's model by the dialect that dburl sets on the
+URL, and `metacmd/describe` formats the answers the way psql does. usql
+writes no query of its own for this (D3, D4).
+
+A driver does nothing to take part. A database that dbmeta has a model for
+answers the describe commands and completes names. One that it has none for
+reports that the describe commands are not supported, and is listed in
+`noModel` in `metadata_test.go` with the reason. A gap or a defect in what a
+database answers goes to dbmeta.
+
+# Agent skills
+
+The repository carries two agent skills. A skill is a set of instructions that
+a coding agent loads for a task. `simple-english` sets how prose is written,
+and `go-pedantry` sets how Go is written. The standing rules in
+[AGENTS.md](AGENTS.md) say when to load each.
+
+`skills-lock.json` names the source of each skill. The `skills` command from
+npm writes that file, and version 1.7.0 is the one used here. It writes each
+skill into two folders. Codex and the other agents read
+`.agents/skills/<name>`, and Claude Code reads `.claude/skills/<name>`.
+
+To add a skill or to update one, run this in the repository root:
+
+```bash
+npx skills@1.7.0 add AminBlg/SimpleEnglish --skill simple-english --agent codex claude-code --copy -y
+```
+
+```bash
+npx skills@1.7.0 add oborchers/fractional-cto --skill go-pedantry --agent codex claude-code --copy -y
+```
+
+Keep `--copy`. Without it, the command writes `.claude/skills/<name>` as a
+symbolic link. A Windows checkout writes a symbolic link as a text file, and
+Claude Code then loads no skill and says nothing. `TestSkillsAreCopies` fails
+on a link, on a missing copy, and when the two folders differ. See D1.
+
+`.claude/settings.local.json` holds the Claude Code permissions of one person.
+The root `.gitignore` ignores it.

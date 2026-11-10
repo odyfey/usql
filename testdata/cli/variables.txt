@@ -1,0 +1,115 @@
+# usql capture transcript v1
+session: variables
+about: \set defines a variable, :name interpolates it, \unset removes it
+term: xterm-256color
+size: 80x24
+
+## step 0
+send:
+
+recv:
+\e[mConnected with driver sqlite3 (VERSION)\r
+\n
+\e[0cType "help" for help.\r
+\n
+\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 1
+send:
+\\set n 42\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\set\e[39m \e[38;5;231mn\e[39m \e[38;5;231m42\e[39m\e[K\r
+\e[23C\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\set\e[39m \e[38;5;231mn\e[39m \e[38;5;231m42\e[39m\e[K\r
+\e[23C\e[?2004l\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 2
+send:
+\\set\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\set\e[39m\e[K\r
+\e[18C\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\set\e[39m\e[K\r
+\e[18C\e[?2004l\r
+\n
+n = '42'\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 3
+send:
+select :n as answer;\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mselect\e[39m \e[38;5;231m:n\e[39m \e[38;5;81mas\e[39m \e[38;5;231manswer;\e[39m\e[K\r
+\e[34C\r
+\e[32msq::memory:=> \e[39m\e[38;5;81mselect\e[39m \e[38;5;231m:n\e[39m \e[38;5;81mas\e[39m \e[38;5;231manswer;\e[39m\e[K\r
+\e[34C\e[?2004l\r
+\n
+ answer \r
+\n
+--------\r
+\n
+     42\r
+\n
+(1 row)\r
+\n
+\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 4
+send:
+\\unset n\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\unset\e[39m \e[38;5;231mn\e[39m\e[K\r
+\e[22C\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\unset\e[39m \e[38;5;231mn\e[39m\e[K\r
+\e[22C\e[?2004l\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 5
+send:
+\\set\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\set\e[39m\e[K\r
+\e[18C\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\set\e[39m\e[K\r
+\e[18C\e[?2004l\r
+\n
+ROW_COUNT = '1'\r
+\n
+\e[?2004h\e[32msq::memory:=> \e[39m
+
+
+## step 6
+send:
+\\q\r
+
+recv:
+\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\q\e[39m\e[K\r
+\e[16C\r
+\e[32msq::memory:=> \e[39m\e[38;5;231m\\q\e[39m\e[K\r
+\e[16C\e[?2004l\r
+\n
+
